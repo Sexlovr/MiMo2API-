@@ -499,7 +499,7 @@ async def anthropic_messages(
     # ═══════════════════════════════════════════════════════════
     if stream:
         async def _wrap():
-            mimo_gen = client.stream_api(query, False, model, multi_medias=multi_medias, conversation_id=conv_id)
+            mimo_gen = client.stream_api(query, False, model, multi_medias=multi_medias, conversation_id=conv_id, tools_enabled=tools_enabled)
             async for event in _anthropic_stream_think_wrapper(
                 mimo_gen, model, msg_id, tool_names=tool_names,
             ):
@@ -519,7 +519,7 @@ async def anthropic_messages(
     # ═══════════════════════════════════════════════════════════
     try:
         content, think_content, usage = await client.call_api(
-            query, False, model, multi_medias=multi_medias, conversation_id=conv_id,
+            query, False, model, multi_medias=multi_medias, conversation_id=conv_id, tools_enabled=tools_enabled,
         )
 
         # 保存用量
@@ -641,7 +641,8 @@ async def anthropic_create_batch_ep(request: Request):
 
         client = MimoClient(account)
         try:
-            c, tc, usage = await client.call_api(query, False, model)
+            # Batch 暂时默认不启用 [tool=on]
+            c, tc, usage = await client.call_api(query, False, model, tools_enabled=False)
             c = _strip_citations(c)
             message = {"role": "assistant", "content": c}
             if tc:
