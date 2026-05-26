@@ -238,21 +238,20 @@ async def _anthropic_stream_think_wrapper(
         if has_tools and sieve:
             for ev in sieve.feed(buf_text):
                 if ev.type == 'text':
-                    clean = _strip_tool_result_blocks(ev.data)
-                    clean = _strip_citations(clean)
-                    clean = _strip_tool_name_prefix(clean, tool_names)
+                    clean = _strip_citations(ev.data)
                     clean = _strip_mimo_prefix(clean)
+                    clean = _strip_tool_result_blocks(clean)
+                    clean = _strip_tool_name_prefix(clean, tool_names)
                     clean = clean_tool_text(clean)
                     if clean:
                         events.extend(_emit_text(clean))
                 elif ev.type == 'tool_calls':
                     collected_tool_calls.extend(ev.data)
         else:
-            clean = _strip_tool_result_blocks(buf_text)
-            clean = _strip_citations(clean)
-            clean = _strip_mimo_prefix(clean)
-            clean = clean_tool_text(clean)
-            events.extend(_emit_text(clean))
+            # 禁用工具时，仅做基础清理（如引用）
+            clean = _strip_citations(buf_text)
+            if clean:
+                events.extend(_emit_text(clean))
         return events
 
     async for ev in mimo_stream:
@@ -433,7 +432,7 @@ async def anthropic_messages(
             msgs_as_objects.append(m)
 
     tools_dict = openai_tools
-    query = build_query_from_messages(msgs_as_objects, tools=tools_dict)
+    query, tools_enabled = build_query_from_messages(msgs_as_objects, tools=tools_dict)
 
     # ── 提取并上传图片/文件 ──
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(msgs_as_objects)
@@ -491,7 +490,7 @@ async def anthropic_messages(
     )
 
     # ── 工具名（用于后续提取） ──
-    tool_names = get_tool_names(tools_dict) if tools_dict else None
+    tool_names = get_tool_names(tools_dict) if (tools_dict and tools_enabled) else None
 
     client = MimoClient(account)
 
@@ -634,7 +633,7 @@ async def anthropic_create_batch_ep(request: Request):
         ob = _anthropic_convert_request(req.get("body", {}))
         msgs = ob.get("messages", [])
         msgs_objs = [OpenAIMessage(**m) if isinstance(m, dict) else m for m in msgs]
-        query = build_query_from_messages(msgs_objs)
+        query, _ = build_query_from_messages(msgs_objs)
 
         account = config_manager.get_next_account()
         if not account:

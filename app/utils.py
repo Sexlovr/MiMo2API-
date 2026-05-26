@@ -372,19 +372,17 @@ def build_query_from_messages(
     messages: list,
     tools: list = None,
     passthrough: bool = False,
-) -> str:
+) -> Tuple[str, bool]:
     """从消息列表构建查询字符串。
 
-    格式：系统消息（含工具提示词）→ 对话历史。
-    MiMo API 没有 system/user 角色分离，query 是纯文本拼接。
-    工具提示词嵌入 system 消息一次，不再每轮重复注入。
-    无 system 消息但有 tools 时自动补 system。
-    passthrough=True 时跳过 MiMoML 格式说明书，直接嵌入原始工具定义。
+    Returns:
+        (query_string, tools_enabled)
     """
     from .tool_call import build_tool_prompt
 
     query_parts = []
     system_text = ""
+    tools_enabled = False
 
     for msg in messages:
         role = msg.role
@@ -398,6 +396,9 @@ def build_query_from_messages(
                         text_parts.append(item.get("text", ""))
                 content = " ".join(text_parts)
             system_text = str(content).strip()
+            if "[tool=on]" in system_text:
+                tools_enabled = True
+                system_text = system_text.replace("[tool=on]", "").strip()
             continue
 
         if isinstance(content, list):
@@ -418,8 +419,8 @@ def build_query_from_messages(
 
         query_parts.append(f"{role}: {content}")
 
-    # 工具提示词嵌入 system 消息（一次，不再每轮重复追加末尾）
-    if tools:
+    # 工具提示词嵌入 system 消息
+    if tools and tools_enabled:
         tool_prompt = build_tool_prompt(tools, passthrough=passthrough)
         if tool_prompt:
             if system_text:
@@ -431,4 +432,4 @@ def build_query_from_messages(
     if system_text:
         query_parts.insert(0, f"system: {system_text}")
 
-    return "\n".join(query_parts)
+    return "\n".join(query_parts), tools_enabled

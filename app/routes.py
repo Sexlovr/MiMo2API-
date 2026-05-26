@@ -262,13 +262,13 @@ def _strip_mimo_prefix(text: str) -> str:
 
 
 def _clean_response_text(text: str, tool_names: list = None) -> str:
-    """综合文本清理管道：TOOL_RESULT + 引用 + 工具前缀 + MiMo前缀 + 工具文本残留。"""
-    text = _strip_tool_result_blocks(text)
+    """综合文本清理管道：引用 + (仅在启用工具时) MiMo前缀 + TOOL_RESULT + 工具前缀 + 工具文本残留。"""
     text = _strip_citations(text)
     if tool_names:
+        text = _strip_mimo_prefix(text)
+        text = _strip_tool_result_blocks(text)
         text = _strip_tool_name_prefix(text, tool_names)
-    text = _strip_mimo_prefix(text)
-    text = clean_tool_text(text)
+        text = clean_tool_text(text)
     return text
 
 
@@ -428,7 +428,7 @@ async def chat_completions(
 
     # 构建查询
     passthrough_mode = request.passthrough or config_manager.config.tools_passthrough
-    query = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
+    query, tools_enabled = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
 
     thinking = bool(request.reasoning_effort)
     client = MimoClient(account)
@@ -442,8 +442,10 @@ async def chat_completions(
 
     # 流式响应
     if request.stream:
+        # 如果没有 [tool=on]，则即使有 tools 也视为没有，禁用 sieve
+        stream_tools = tools_dict if tools_enabled else None
         return StreamingResponse(
-            _stream_response(client, query, thinking, effective_model, tools_dict, multi_medias, passthrough=passthrough_mode,
+            _stream_response(client, query, thinking, effective_model, stream_tools, multi_medias, passthrough=passthrough_mode,
                              conv_id=conv_id, account_id=account.user_id),
             media_type="text/event-stream",
             headers={
@@ -476,7 +478,7 @@ async def chat_completions(
         # 提取工具调用
         tool_names = []
         tool_calls = None
-        if tools_dict:
+        if tools_dict and tools_enabled:
             tool_names = get_tool_names(tools_dict)
             result = extract_tool_call(content, tool_names)
             if result:
@@ -485,8 +487,8 @@ async def chat_completions(
                 if result[1] is not None:
                     content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
 
-        # 清洗工具名前缀
-        content = _strip_tool_name_prefix(content, tool_names)
+            # 清洗工具名前缀
+            content = _strip_tool_name_prefix(content, tool_names)
 
         if tool_calls:
             return _build_response(
@@ -1453,7 +1455,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
     tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
 
     # 构建查询
-    query = build_query_from_messages(openai_messages, tools=tools_dict)
+    query, tools_enabled = build_query_from_messages(openai_messages, tools=tools_dict)
 
     thinking = False
 
@@ -1503,7 +1505,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
     # 工具调用提取
     tool_names = []
     tool_calls = None
-    if tools_dict:
+    if tools_dict and tools_enabled:
         tool_names = get_tool_names(tools_dict)
         result = extract_tool_call(content, tool_names)
         if result:
@@ -1512,7 +1514,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
             if result[1] is not None:
                 content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
 
-    content = _strip_tool_name_prefix(content, tool_names)
+        content = _strip_tool_name_prefix(content, tool_names)
 
     if tool_calls:
         for tc in tool_calls:
@@ -1591,7 +1593,7 @@ async def _stream_response_events(body: dict, account):
                 multi_medias.append(media_obj)
 
     tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
-    query = build_query_from_messages(openai_messages, tools=tools_dict)
+    query, tools_enabled = build_query_from_messages(openai_messages, tools=tools_dict)
     thinking = False
 
     response_id = body.get("_response_id") or _gen_response_id()
@@ -1635,7 +1637,7 @@ async def _stream_response_events(body: dict, account):
         return output_index, None
 
     client = MimoClient(account)
-    has_tools = tools_dict is not None
+    has_tools = tools_dict is not None and tools_enabled
 
     try:
         if has_tools:
