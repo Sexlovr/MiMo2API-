@@ -262,13 +262,13 @@ def _strip_mimo_prefix(text: str) -> str:
 
 
 def _clean_response_text(text: str, tool_names: list = None) -> str:
-    """综合文本清理管道：TOOL_RESULT + 引用 + 工具前缀 + MiMo前缀 + 工具文本残留。"""
-    text = _strip_tool_result_blocks(text)
+    """综合文本清理管道：引用 + (仅在启用工具时) MiMo前缀 + TOOL_RESULT + 工具前缀 + 工具文本残留。"""
     text = _strip_citations(text)
     if tool_names:
+        text = _strip_mimo_prefix(text)
+        text = _strip_tool_result_blocks(text)
         text = _strip_tool_name_prefix(text, tool_names)
-    text = _strip_mimo_prefix(text)
-    text = clean_tool_text(text)
+        text = clean_tool_text(text)
     return text
 
 
@@ -428,7 +428,7 @@ async def chat_completions(
 
     # 构建查询
     passthrough_mode = request.passthrough or config_manager.config.tools_passthrough
-    query = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
+    query, tools_enabled = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
 
     thinking = bool(request.reasoning_effort)
     client = MimoClient(account)
@@ -442,9 +442,11 @@ async def chat_completions(
 
     # 流式响应
     if request.stream:
+        # 如果没有 [tool=on]，则即使有 tools 也视为没有，禁用 sieve
+        stream_tools = tools_dict if tools_enabled else None
         return StreamingResponse(
-            _stream_response(client, query, thinking, effective_model, tools_dict, multi_medias, passthrough=passthrough_mode,
-                             conv_id=conv_id, account_id=account.user_id),
+            _stream_response(client, query, thinking, effective_model, stream_tools, multi_medias, passthrough=passthrough_mode,
+                             conv_id=conv_id, account_id=account.user_id, tools_enabled=tools_enabled),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -456,7 +458,7 @@ async def chat_completions(
     # 非流式响应
     try:
         content, think_content, usage = await client.call_api(
-            query, thinking, effective_model, multi_medias, conversation_id=conv_id)
+            query, thinking, effective_model, multi_medias, conversation_id=conv_id, tools_enabled=tools_enabled)
 
         # 保存用量
         if usage:
@@ -466,17 +468,15 @@ async def chat_completions(
         # 首次消息：记录真实指纹
         _update_session_fingerprint(account.user_id, conv_id, request.messages)
 
-        # 清理模型输出杂质
-        content = _strip_tool_result_blocks(content)
-        content = _strip_citations(content)
-        content = clean_tool_text(content)
+        # 清理模型输出
+        content = _clean_response_text(content, tool_names=(get_tool_names(tools_dict) if tools_enabled else None))
 
         msg_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         # 提取工具调用
         tool_names = []
         tool_calls = None
-        if tools_dict:
+        if tools_dict and tools_enabled:
             tool_names = get_tool_names(tools_dict)
             result = extract_tool_call(content, tool_names)
             if result:
@@ -485,8 +485,8 @@ async def chat_completions(
                 if result[1] is not None:
                     content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
 
-        # 清洗工具名前缀
-        content = _strip_tool_name_prefix(content, tool_names)
+            # 清洗工具名前缀
+            content = _strip_tool_name_prefix(content, tool_names)
 
         if tool_calls:
             return _build_response(
@@ -516,6 +516,7 @@ async def _stream_response(
     tools: list = None, multi_medias: list = None,
     passthrough: bool = False,
     conv_id: str = None, account_id: str = None,
+    tools_enabled: bool = False,
 ):
     """流式响应生成器。
 
@@ -555,7 +556,7 @@ async def _stream_response(
             buffer = ""
             last_usage = None
 
-            async for sse_data in client.stream_api(query, thinking, model, multi_medias):
+            async for sse_data in client.stream_api(query, thinking, model, multi_medias, tools_enabled=tools_enabled):
                 # 用量事件
                 if sse_data.get("type") == "usage":
                     last_usage = sse_data
@@ -661,7 +662,7 @@ async def _stream_response(
             in_think = False
             last_usage = None
 
-            async for sse_data in client.stream_api(query, thinking, model, multi_medias):
+            async for sse_data in client.stream_api(query, thinking, model, multi_medias, tools_enabled=tools_enabled):
                 if sse_data.get("type") == "usage":
                     last_usage = sse_data
                     continue
@@ -677,7 +678,7 @@ async def _stream_response(
                         if idx != -1:
                             safe, keep = _safe_flush(buffer[:idx])
                             if safe:
-                                clean = _clean_response_text(safe)
+                                clean = _clean_response_text(safe, tool_names=None)
                                 if clean:
                                     yield _build_chunk(msg_id, model, created=created_t, content=clean)
                             in_think = True
@@ -686,7 +687,7 @@ async def _stream_response(
 
                         safe, keep = _safe_flush(buffer)
                         if safe:
-                            clean = _clean_response_text(safe)
+                            clean = _clean_response_text(safe, tool_names=None)
                             if clean:
                                 yield _build_chunk(msg_id, model, created=created_t, content=clean)
                         buffer = keep
@@ -709,7 +710,7 @@ async def _stream_response(
 
             # 发送剩余内容
             if buffer:
-                clean = _clean_response_text(buffer)
+                clean = _clean_response_text(buffer, tool_names=None)
                 if clean:
                     if in_think:
                         yield _build_chunk(msg_id, model, created=created_t, reasoning=clean)
@@ -1453,7 +1454,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
     tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
 
     # 构建查询
-    query = build_query_from_messages(openai_messages, tools=tools_dict)
+    query, tools_enabled = build_query_from_messages(openai_messages, tools=tools_dict)
 
     thinking = False
 
@@ -1461,7 +1462,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
     client = MimoClient(account)
     try:
         content, think_content, usage = await client.call_api(
-            query, thinking, effective_model, multi_medias
+            query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled
         )
     except MimoApiError as e:
         raise HTTPException(
@@ -1474,9 +1475,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
         raise HTTPException(status_code=500, detail={"error": {"message": str(e)}})
 
     # 清理输出
-    content = _strip_tool_result_blocks(content)
-    content = _strip_citations(content)
-    content = clean_tool_text(content)
+    content = _clean_response_text(content, tool_names=(get_tool_names(tools_dict) if tools_enabled else None))
 
     # 额外处理：模型可能输出多个 think 块，_parse_think_tags 只剥除了第一个
     remaining_thinks = []
@@ -1503,7 +1502,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
     # 工具调用提取
     tool_names = []
     tool_calls = None
-    if tools_dict:
+    if tools_dict and tools_enabled:
         tool_names = get_tool_names(tools_dict)
         result = extract_tool_call(content, tool_names)
         if result:
@@ -1512,7 +1511,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
             if result[1] is not None:
                 content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
 
-    content = _strip_tool_name_prefix(content, tool_names)
+        content = _strip_tool_name_prefix(content, tool_names)
 
     if tool_calls:
         for tc in tool_calls:
@@ -1591,7 +1590,7 @@ async def _stream_response_events(body: dict, account):
                 multi_medias.append(media_obj)
 
     tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
-    query = build_query_from_messages(openai_messages, tools=tools_dict)
+    query, tools_enabled = build_query_from_messages(openai_messages, tools=tools_dict)
     thinking = False
 
     response_id = body.get("_response_id") or _gen_response_id()
@@ -1635,7 +1634,7 @@ async def _stream_response_events(body: dict, account):
         return output_index, None
 
     client = MimoClient(account)
-    has_tools = tools_dict is not None
+    has_tools = tools_dict is not None and tools_enabled
 
     try:
         if has_tools:
@@ -1648,7 +1647,10 @@ async def _stream_response_events(body: dict, account):
             in_think = False
             buffer = ""
 
-            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias):
+            # 仅在启用工具时传递工具名进行清理
+            clean_tools = tools_dict if tools_enabled else None
+
+            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled):
                 if sse_data.get("type") == "usage":
                     continue
                 chunk = sse_data.get("content", "")
@@ -1871,7 +1873,10 @@ async def _stream_response_events(body: dict, account):
             in_think = False
             buffer = ""
 
-            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias):
+            # 仅在启用工具时传递工具名进行清理
+            clean_tools = tools_dict if tools_enabled else None
+
+            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled):
                 if sse_data.get("type") == "usage":
                     continue
                 chunk = sse_data.get("content", "")
@@ -1886,7 +1891,7 @@ async def _stream_response_events(body: dict, account):
                         if idx != -1:
                             safe, keep = _safe_flush(buffer[:idx])
                             if safe:
-                                clean = _clean_response_text(safe)
+                                clean = _clean_response_text(safe, tool_names=None)
                                 if clean:
                                     text_parts.append(clean)
                                     if not content_started:
@@ -1915,7 +1920,7 @@ async def _stream_response_events(body: dict, account):
 
                         safe, keep = _safe_flush(buffer)
                         if safe:
-                            clean = _clean_response_text(safe)
+                            clean = _clean_response_text(safe, tool_names=None)
                             if clean:
                                 text_parts.append(clean)
                                 if not content_started:
@@ -1981,7 +1986,7 @@ async def _stream_response_events(body: dict, account):
 
             # 发送剩余缓冲区内容
             if buffer:
-                clean = _clean_response_text(buffer)
+                clean = _clean_response_text(buffer, tool_names=None)
                 if clean:
                     if in_think:
                         reasoning_parts.append(clean)

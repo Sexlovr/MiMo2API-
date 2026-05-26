@@ -66,12 +66,13 @@ class MimoClient:
             "attachments": attachments or []
         }
 
-    async def call_api(self, query: str, thinking: bool = False, model: str = "mimo-v2-pro", multi_medias: list = None, attachments: list = None, conversation_id: str = None) -> Tuple[str, str, dict]:
+    async def call_api(self, query: str, thinking: bool = False, model: str = "mimo-v2-pro", multi_medias: list = None, attachments: list = None, conversation_id: str = None, tools_enabled: bool = False) -> Tuple[str, str, dict]:
         """
         调用Mimo API（非流式）
 
         Args:
             conversation_id: 复用现有 MiMo 会话 ID（None=新建）
+            tools_enabled: 是否启用工具（不启用则不做任何过滤）
 
         Returns:
             (content, think_content, usage)
@@ -102,9 +103,10 @@ class MimoClient:
                         if isinstance(sse_data, dict):
                             if sse_data.get("type") == "text":
                                 content = sse_data.get("content", "")
-                                # 过滤 MiMo 原生前缀
-                                if content.strip() not in self._MIMO_SSE_PREFIXES:
-                                    result.append(content)
+                                # 仅在 tools_enabled=True 时过滤 MiMo 原生前缀
+                                if tools_enabled and content.strip() in self._MIMO_SSE_PREFIXES:
+                                    continue
+                                result.append(content)
                             if "promptTokens" in sse_data:
                                 usage = {
                                     "promptTokens": sse_data.get("promptTokens", 0),
@@ -122,12 +124,12 @@ class MimoClient:
 
             return content, think_content, usage
 
-    async def stream_api(self, query: str, thinking: bool = False, model: str = "mimo-v2-pro", multi_medias: list = None, attachments: list = None, conversation_id: str = None) -> AsyncIterator[dict]:
+    async def stream_api(self, query: str, thinking: bool = False, model: str = "mimo-v2-pro", multi_medias: list = None, attachments: list = None, conversation_id: str = None, tools_enabled: bool = False) -> AsyncIterator[dict]:
         """
         调用Mimo API（流式）
 
         Yields:
-            SSE数据字典（仅 type=text 且有 content 的，已过滤 MiMo 原生前缀）
+            SSE数据字典
         """
         body = self._create_request_body(query, thinking, model, multi_medias, attachments, conversation_id)
 
@@ -169,11 +171,11 @@ class MimoClient:
                     # except Exception:
                     #     pass
 
-                    # 过滤 MiMo 原生 SSE 前缀事件（如 SSE #2 的 'webSearch'）
-                    if sse_data.get("type") == "text" and sse_data.get("content"):
+                    # 仅在 tools_enabled=True 时过滤 MiMo 原生 SSE 前缀事件
+                    if tools_enabled and sse_data.get("type") == "text" and sse_data.get("content"):
                         content_val = sse_data["content"].strip()
                         if content_val in self._MIMO_SSE_PREFIXES:
-                            continue  # 跳过 MiMo 原生的工具名 SSE 事件
+                            continue
 
                     # 只 yield text 类型和 usage 事件
                     if sse_data.get("type") == "text" and sse_data.get("content"):
