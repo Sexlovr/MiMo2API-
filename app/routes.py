@@ -1648,7 +1648,7 @@ async def _stream_response_events(body: dict, account):
             buffer = ""
 
             # 仅在启用工具时传递工具名进行清理
-            clean_tools = tools_dict if tools_enabled else None
+            clean_tools = get_tool_names(tools_dict) if tools_enabled else None
 
             async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled):
                 if sse_data.get("type") == "usage":
@@ -1986,7 +1986,7 @@ async def _stream_response_events(body: dict, account):
 
             # 发送剩余缓冲区内容
             if buffer:
-                clean = _clean_response_text(buffer, tool_names=None)
+                clean = _clean_response_text(buffer, tool_names=clean_tools)
                 if clean:
                     if in_think:
                         reasoning_parts.append(clean)

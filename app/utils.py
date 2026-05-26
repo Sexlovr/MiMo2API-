@@ -395,10 +395,12 @@ def build_query_from_messages(
                     if isinstance(item, dict) and item.get("type") == "text":
                         text_parts.append(item.get("text", ""))
                 content = " ".join(text_parts)
-            system_text = str(content).strip()
-            if "[tool=on]" in system_text:
+            st = str(content).strip()
+            if "[tool=on]" in st:
                 tools_enabled = True
-                system_text = system_text.replace("[tool=on]", "").strip()
+                st = st.replace("[tool=on]", "").strip()
+            if st:
+                system_text = (system_text + "\n" + st).strip() if system_text else st
             continue
 
         if isinstance(content, list):
