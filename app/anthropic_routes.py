@@ -53,6 +53,7 @@ from .usage_store import add_usage as _add_usage
 from .routes import (
     _strip_citations, _strip_tool_result_blocks,
     _strip_tool_name_prefix, _strip_mimo_prefix, _safe_flush,
+    _clean_response_text,
     validate_api_key,
 )
 
@@ -528,8 +529,7 @@ async def anthropic_messages(
             _update_session_tokens(account.user_id, conv_id, usage.get("promptTokens", 0))
 
         # 清理模型输出
-        content = _strip_tool_result_blocks(content)
-        content = _strip_citations(content)
+        content = _clean_response_text(content, tool_names=tool_names)
 
         # 提取工具调用
         tool_calls = None
@@ -540,9 +540,6 @@ async def anthropic_messages(
                     tool_calls = result[0]
                 if result[1] is not None:
                     content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
-
-        content = _strip_tool_name_prefix(content, tool_names or [])
-        content = _strip_mimo_prefix(content)
 
         # 构建 OpenAI 格式的非流式响应
         message = {"role": "assistant", "content": content}

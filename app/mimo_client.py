@@ -188,22 +188,30 @@ class MimoClient:
     @staticmethod
     def _parse_think_tags(text: str) -> Tuple[str, str]:
         """
-        解析think标签
+        解析think标签，提取所有 think 块并从正文中移除。
 
         Returns:
             (content, think_content)
         """
-        start = text.find("<think>")
-        if start == -1:
-            return text, ""
+        import re
+        think_blocks = []
 
-        end = text.find("</think>")
-        if end == -1:
-            return text, ""
+        def replace_fn(match):
+            think_blocks.append(match.group(1).strip())
+            return ""
 
-        think_content = text[start + 7:end]
-        content = text[end + 8:]
-        return content, think_content
+        # 移除所有 <think>...</think> 块
+        content = re.sub(r'<think>(.*?)</think>', replace_fn, text, flags=re.DOTALL)
+
+        # 移除可能未闭合的 <think> 标签及其后续内容
+        if '<think>' in content:
+            parts = content.split('<think>', 1)
+            content = parts[0]
+            think_blocks.append(parts[1].strip())
+
+        think_content = "\n".join(filter(None, think_blocks))
+        # 仅去除首尾多余空白，保留内部空格
+        return content.strip(), think_content
 
     async def delete_conversations(self, conversation_ids: list) -> bool:
         """删除 MiMo 服务端对话记录。
