@@ -213,14 +213,14 @@ def _strip_tool_result_blocks(text: str) -> str:
     cleaned = re.sub(r'\[tool_result\s+id=\S+\]\s*', '', cleaned, flags=re.IGNORECASE)
     # XML 格式: <tool_result>...</tool_result>（模型学会的另一种格式）
     cleaned = re.sub(r'</?tool_result>\s*', '', cleaned, flags=re.IGNORECASE)
-    return cleaned.strip()
+    return cleaned
 
 
 def _strip_citations(text: str) -> str:
     """移除 MiMo 模型输出的引用标记，如 (citation:1)(citation:14)。"""
     if not text:
         return text
-    return re.sub(r'\(citation:\d+\)\s*', '', text).strip()
+    return re.sub(r'\(citation:\d+\)\s*', '', text)
 
 
 def _camel_case(name: str) -> str:
@@ -242,8 +242,8 @@ def _strip_tool_name_prefix(text: str, tool_names: list) -> str:
         if '_' in n:
             variants.append(re.escape(_camel_case(n)))
     escaped = '|'.join(variants)
-    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text.strip(), flags=re.IGNORECASE)
-    return cleaned.strip()
+    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text, flags=re.IGNORECASE)
+    return cleaned
 
 
 def _strip_mimo_prefix(text: str) -> str:
@@ -257,8 +257,8 @@ def _strip_mimo_prefix(text: str) -> str:
                 'imageSearch', 'fileSearch', 'getLocation', 'webExtract',
                 'getWeather', 'calculator']
     escaped = '|'.join(re.escape(p) for p in prefixes)
-    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text.strip(), flags=re.IGNORECASE)
-    return cleaned.strip()
+    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text, flags=re.IGNORECASE)
+    return cleaned
 
 
 def _clean_response_text(text: str, tool_names: list = None) -> str:
@@ -1476,21 +1476,6 @@ async def _do_response_chat(body: dict, account) -> tuple:
 
     # 清理输出
     content = _clean_response_text(content, tool_names=(get_tool_names(tools_dict) if tools_enabled else None))
-
-    # 额外处理：模型可能输出多个 think 块，_parse_think_tags 只剥除了第一个
-    remaining_thinks = []
-    cleaned_content = re.sub(
-        r'<think>(.*?)</think>',
-        lambda m: remaining_thinks.append(m.group(1).strip()) or '',
-        content,
-        flags=re.DOTALL
-    )
-    # 过滤空 think 块（模型可能输出 <think></think>）
-    remaining_thinks = [t for t in remaining_thinks if t]
-    if remaining_thinks:
-        content = cleaned_content.strip()
-        extra_think = '\n'.join(remaining_thinks)
-        think_content = (think_content + '\n' + extra_think).strip() if think_content else extra_think
 
     # 构建 items
     items = []
