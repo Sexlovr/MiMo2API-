@@ -209,19 +209,19 @@ def _strip_tool_result_blocks(text: str) -> str:
     """
     if not text:
         return text
-    cleaned = re.sub(r'\[TOOL_RESULT\]\s*', '', text, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\[/TOOL_RESULT\]\s*', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\[tool_result\s+id=\S+\]\s*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\[TOOL_RESULT\]', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\[/TOOL_RESULT\]', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\[tool_result\s+id=\S+\]', '', cleaned, flags=re.IGNORECASE)
     # XML 格式: <tool_result>...</tool_result>（模型学会的另一种格式）
-    cleaned = re.sub(r'</?tool_result>\s*', '', cleaned, flags=re.IGNORECASE)
-    return cleaned.strip()
+    cleaned = re.sub(r'</?tool_result>', '', cleaned, flags=re.IGNORECASE)
+    return cleaned
 
 
 def _strip_citations(text: str) -> str:
     """移除 MiMo 模型输出的引用标记，如 (citation:1)(citation:14)。"""
     if not text:
         return text
-    return re.sub(r'\(citation:\d+\)\s*', '', text).strip()
+    return re.sub(r'\(citation:\d+\)', '', text)
 
 
 def _camel_case(name: str) -> str:
@@ -243,8 +243,8 @@ def _strip_tool_name_prefix(text: str, tool_names: list) -> str:
         if '_' in n:
             variants.append(re.escape(_camel_case(n)))
     escaped = '|'.join(variants)
-    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text.strip(), flags=re.IGNORECASE)
-    return cleaned.strip()
+    cleaned = re.sub(rf'^({escaped})\n?', '', text, flags=re.IGNORECASE)
+    return cleaned
 
 
 def _strip_mimo_prefix(text: str) -> str:
@@ -258,8 +258,8 @@ def _strip_mimo_prefix(text: str) -> str:
                 'imageSearch', 'fileSearch', 'getLocation', 'webExtract',
                 'getWeather', 'calculator']
     escaped = '|'.join(re.escape(p) for p in prefixes)
-    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text.strip(), flags=re.IGNORECASE)
-    return cleaned.strip()
+    cleaned = re.sub(rf'^({escaped})\n?', '', text, flags=re.IGNORECASE)
+    return cleaned
 
 
 def _clean_response_text(text: str, tool_names: list = None) -> str:
@@ -412,12 +412,13 @@ async def chat_completions(
     tools_enabled = config["tools_enabled"]
     web_search = config["search_enabled"]
     thinking = config["think_enabled"] if config["think_enabled"] is not None else bool(request.reasoning_effort)
-    client = MimoClient(account)
 
     # 会话管理：每次请求都创建全新的会话
     conv_id, conv_is_new = _get_or_create_session(
         account.user_id, request.messages, request.model
     )
+
+    client = MimoClient(account)
 
     # 提取媒体和文本文件
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(request.messages)
@@ -426,12 +427,8 @@ async def chat_completions(
     multi_medias = []
     attachments = []
 
-    # 1. 文件上下文策略：将 full_history 上传为 txt
-    history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
-    if history_media_obj:
-        multi_medias.append(history_media_obj)
-        attachments.append(history_media_obj)
+    # 1. 组合完整上下文发送
+    query = full_history
 
     # 2. 用户上传的媒体
     if base64_medias:
@@ -1479,12 +1476,8 @@ async def _do_response_chat(body: dict, account) -> tuple:
     multi_medias = []
     attachments = []
 
-    # 1. 文件上下文策略：将 full_history 上传为 txt
-    history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
-    if history_media_obj:
-        multi_medias.append(history_media_obj)
-        attachments.append(history_media_obj)
+    # 1. 组合完整上下文发送
+    query = full_history
 
     # 2. 用户上传的媒体
     if base64_medias:
@@ -1613,6 +1606,7 @@ async def _stream_response_events(body: dict, account):
         if structured_format == "json_schema":
             instruction_text = "Please respond with valid JSON matching this schema."
         else:
+            schema = None
             instruction_text = "Please respond with valid JSON object."
         sys_instruction = {"role": "system", "content": instruction_text}
         if has_system:
@@ -1641,12 +1635,8 @@ async def _stream_response_events(body: dict, account):
     multi_medias = []
     attachments = []
 
-    # 1. 文件上下文策略：将 full_history 上传为 txt
-    history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
-    if history_media_obj:
-        multi_medias.append(history_media_obj)
-        attachments.append(history_media_obj)
+    # 1. 组合完整上下文发送
+    query = full_history
 
     # 2. 用户上传的媒体
     if base64_medias:
@@ -1795,95 +1785,101 @@ async def _stream_response_events_inner(
                                                 "content_index": 0,
                                                 "delta": clean,
                                             }
-                            in_think = True
-                            buffer = buffer[idx + len(THINK_OPEN):]
-                            continue
-
-                        safe, keep = _safe_flush(buffer)
-                        if safe:
-                            for ev in sieve.feed(safe):
-                                if ev.type == 'text':
-                                    clean = _clean_response_text(ev.data, tool_names)
-                                    if clean:
-                                        text_parts.append(clean)
-                                        if not content_started:
-                                            content_started = True
-                                            item = _response_text_item("", message_item_id)
-                                            oi, start_evt = _start_output_item(item)
+                                    elif ev.type == 'tool_calls':
+                                        for tc in ev.data:
+                                            idx = len(tool_calls_map)
+                                            fc_item = _response_function_call_item(tc)
+                                            fc_id = fc_item["id"]
+                                            tool_calls_map[idx] = {
+                                                "id": fc_id,
+                                                "call_id": fc_item.get("call_id", fc_id),
+                                                "name": tc.get("function", {}).get("name", ""),
+                                                "arguments": tc.get("function", {}).get("arguments", "{}"),
+                                                "status": "completed",
+                                            }
+                                            # output_item.added 不预填 arguments
+                                            added_item = {k: v for k, v in fc_item.items() if k != "arguments"}
+                                            oi, start_evt = _start_output_item(added_item)
                                             if start_evt:
                                                 yield start_evt
+                                            # 始终通过 delta 传递参数
+                                            args_str = fc_item.get("arguments", "{}")
                                             yield {
-                                                "type": "response.content_part.added",
-                                                "item_id": message_item_id,
+                                                "type": "response.function_call_arguments.delta",
+                                                "item_id": fc_id,
                                                 "output_index": oi,
-                                                "content_index": 0,
-                                                "part": item["content"][0],
+                                                "delta": args_str,
                                             }
-                                        yield {
-                                            "type": "response.output_text.delta",
-                                            "item_id": message_item_id,
-                                            "output_index": output_indices.get(message_item_id, 0),
-                                            "content_index": 0,
-                                            "delta": clean,
-                                        }
-                                elif ev.type == 'tool_calls':
-                                    for tc in ev.data:
-                                        idx = len(tool_calls_map)
-                                        fc_item = _response_function_call_item(tc)
-                                        fc_id = fc_item["id"]
-                                        tool_calls_map[idx] = {
-                                            "id": fc_id,
-                                            "call_id": fc_item.get("call_id", fc_id),
-                                            "name": tc.get("function", {}).get("name", ""),
-                                            "arguments": tc.get("function", {}).get("arguments", "{}"),
-                                            "status": "completed",
-                                        }
-                                        # output_item.added 不预填 arguments
-                                        added_item = {k: v for k, v in fc_item.items() if k != "arguments"}
-                                        oi, start_evt = _start_output_item(added_item)
+                        in_think = True
+                        buffer = buffer[idx + len(THINK_OPEN):]
+                        continue
+
+                    safe, keep = _safe_flush(buffer)
+                    if safe:
+                        for ev in sieve.feed(safe):
+                            if ev.type == 'text':
+                                clean = _clean_response_text(ev.data, tool_names)
+                                if clean:
+                                    text_parts.append(clean)
+                                    if not content_started:
+                                        content_started = True
+                                        item = _response_text_item("", message_item_id)
+                                        oi, start_evt = _start_output_item(item)
                                         if start_evt:
                                             yield start_evt
-                                        # 始终通过 delta 传递参数
-                                        args_str = fc_item.get("arguments", "{}")
                                         yield {
-                                            "type": "response.function_call_arguments.delta",
-                                            "item_id": fc_id,
+                                            "type": "response.content_part.added",
+                                            "item_id": message_item_id,
                                             "output_index": oi,
-                                            "delta": args_str,
+                                            "content_index": 0,
+                                            "part": item["content"][0],
                                         }
-                        buffer = keep
-                        break
-                    else:
-                        idx = buffer.find(THINK_CLOSE)
-                        if idx != -1:
-                            safe, keep = _safe_flush(buffer[:idx])
-                            if safe:
-                                reasoning_parts.append(safe)
-                                if len(reasoning_parts) == len(safe) == len(safe):
-                                    pass
-                                item = _response_reasoning_item("", reasoning_item_id)
-                                oi, start_evt = _start_output_item(item)
-                                if start_evt:
-                                    yield start_evt
-                                yield {
-                                    "type": "response.reasoning_text.delta",
-                                    "item_id": reasoning_item_id,
-                                    "output_index": output_indices.get(reasoning_item_id, 0),
-                                    "content_index": 0,
-                                    "delta": safe,
-                                }
-                            in_think = False
-                            buffer = buffer[idx + len(THINK_CLOSE):]
-                            continue
-
-                        safe, keep = _safe_flush(buffer)
+                                    yield {
+                                        "type": "response.output_text.delta",
+                                        "item_id": message_item_id,
+                                        "output_index": output_indices.get(message_item_id, 0),
+                                        "content_index": 0,
+                                        "delta": clean,
+                                    }
+                            elif ev.type == 'tool_calls':
+                                for tc in ev.data:
+                                    idx = len(tool_calls_map)
+                                    fc_item = _response_function_call_item(tc)
+                                    fc_id = fc_item["id"]
+                                    tool_calls_map[idx] = {
+                                        "id": fc_id,
+                                        "call_id": fc_item.get("call_id", fc_id),
+                                        "name": tc.get("function", {}).get("name", ""),
+                                        "arguments": tc.get("function", {}).get("arguments", "{}"),
+                                        "status": "completed",
+                                    }
+                                    # output_item.added 不预填 arguments
+                                    added_item = {k: v for k, v in fc_item.items() if k != "arguments"}
+                                    oi, start_evt = _start_output_item(added_item)
+                                    if start_evt:
+                                        yield start_evt
+                                    # 始终通过 delta 传递参数
+                                    args_str = fc_item.get("arguments", "{}")
+                                    yield {
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": fc_id,
+                                        "output_index": oi,
+                                        "delta": args_str,
+                                    }
+                    buffer = keep
+                    break
+                else:
+                    idx = buffer.find(THINK_CLOSE)
+                    if idx != -1:
+                        safe, keep = _safe_flush(buffer[:idx])
                         if safe:
                             reasoning_parts.append(safe)
-                            if len(reasoning_parts) == len(safe):
-                                item = _response_reasoning_item("", reasoning_item_id)
-                                oi, start_evt = _start_output_item(item)
-                                if start_evt:
-                                    yield start_evt
+                            if len(reasoning_parts) == len(safe) == len(safe):
+                                pass
+                            item = _response_reasoning_item("", reasoning_item_id)
+                            oi, start_evt = _start_output_item(item)
+                            if start_evt:
+                                yield start_evt
                             yield {
                                 "type": "response.reasoning_text.delta",
                                 "item_id": reasoning_item_id,
@@ -1891,8 +1887,27 @@ async def _stream_response_events_inner(
                                 "content_index": 0,
                                 "delta": safe,
                             }
-                        buffer = keep
-                        break
+                        in_think = False
+                        buffer = buffer[idx + len(THINK_CLOSE):]
+                        continue
+
+                    safe, keep = _safe_flush(buffer)
+                    if safe:
+                        reasoning_parts.append(safe)
+                        if len(reasoning_parts) == len(safe):
+                            item = _response_reasoning_item("", reasoning_item_id)
+                            oi, start_evt = _start_output_item(item)
+                            if start_evt:
+                                yield start_evt
+                        yield {
+                            "type": "response.reasoning_text.delta",
+                            "item_id": reasoning_item_id,
+                            "output_index": output_indices.get(reasoning_item_id, 0),
+                            "content_index": 0,
+                            "delta": safe,
+                        }
+                    buffer = keep
+                    break
 
             # Flush buffer
             if buffer and not in_think:

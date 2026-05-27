@@ -112,11 +112,11 @@ class MimoClient:
                         sse_data = json.loads(data)
                         if isinstance(sse_data, dict):
                             if sse_data.get("type") == "text":
-                                content = sse_data.get("content", "")
+                                chunk_text = sse_data.get("content", "")
                                 # 仅在 tools_enabled=True 时过滤 MiMo 原生前缀
-                                if tools_enabled and content.strip() in self._MIMO_SSE_PREFIXES:
+                                if tools_enabled and chunk_text.strip() in self._MIMO_SSE_PREFIXES:
                                     continue
-                                result.append(content)
+                                result.append(chunk_text)
                             if "promptTokens" in sse_data:
                                 usage = {
                                     "promptTokens": sse_data.get("promptTokens", 0),

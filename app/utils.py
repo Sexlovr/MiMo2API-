@@ -449,6 +449,4 @@ def build_query_from_messages(
     if not last_user_msg:
         last_user_msg = "Please continue."
 
-    final_query = f"[system check:- read the file recheck the content carefully twice then do whatever the context is .]\n\n{last_user_msg}"
-
-    return final_query, config, full_history
+    return last_user_msg, config, full_history

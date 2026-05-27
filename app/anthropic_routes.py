@@ -13,6 +13,7 @@ import uuid
 import time
 import re
 import httpx
+import asyncio
 import base64 as b64
 from typing import Optional, AsyncIterator
 
@@ -435,6 +436,9 @@ async def anthropic_messages(
     tools_dict = openai_tools
     query, config, full_history = build_query_from_messages(msgs_as_objects, tools=tools_dict)
 
+    # 组合完整上下文发送
+    query = full_history
+
     tools_enabled = config["tools_enabled"]
     web_search = config["search_enabled"]
     thinking = config["think_enabled"] if config["think_enabled"] is not None else False
@@ -473,13 +477,6 @@ async def anthropic_messages(
 
     multi_medias = []
     attachments = []
-
-    # 文件上下文策略
-    history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, model)
-    if history_media_obj:
-        multi_medias.append(history_media_obj)
-        attachments.append(history_media_obj)
 
     # 上传到 MiMo CDN
     if base64_medias:
@@ -534,7 +531,6 @@ async def anthropic_messages(
                 # Stateless 策略：流结束后立即删除会话
                 if client and conv_id:
                     # 使用 ensure_future 确保任务在后台运行
-                    import asyncio
                     asyncio.create_task(client.delete_conversations([conv_id]))
 
         return StreamingResponse(
@@ -563,7 +559,6 @@ async def anthropic_messages(
     finally:
         # 非流式模式：请求完成后立即删除会话
         if client and conv_id:
-            import asyncio
             asyncio.create_task(client.delete_conversations([conv_id]))
 
     try:
@@ -703,7 +698,6 @@ async def anthropic_create_batch_ep(request: Request):
         except Exception as e:
             return _anthropic_error_response(str(e)[:500], "api_error")
 
-    import asyncio
     asyncio.create_task(_anthropic_process_batch_requests(batch["id"], _process_one))
     return batch
 
