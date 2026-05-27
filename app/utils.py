@@ -368,18 +368,22 @@ def build_query_from_messages(
     messages: list,
     tools: list = None,
     passthrough: bool = False,
-) -> Tuple[str, bool, str]:
+) -> Tuple[str, dict, str]:
     """从消息列表构建查询。
     现已修改为支持文件上下文策略。
 
     Returns:
-        (last_user_message, tools_enabled, full_history_string)
+        (last_user_message, config_dict, full_history_string)
     """
     from .tool_call import build_tool_prompt
 
     history_parts = []
     system_text = ""
-    tools_enabled = False
+    config = {
+        "tools_enabled": False,
+        "think_enabled": None,  # None means use default from request
+        "search_enabled": False,
+    }
     last_user_msg = ""
 
     for msg in messages:
@@ -396,8 +400,23 @@ def build_query_from_messages(
         if role == "system":
             st = str(content).strip()
             if "[tool=on]" in st:
-                tools_enabled = True
+                config["tools_enabled"] = True
                 st = st.replace("[tool=on]", "").strip()
+
+            if "[think=on]" in st:
+                config["think_enabled"] = True
+                st = st.replace("[think=on]", "").strip()
+            elif "[think=off]" in st:
+                config["think_enabled"] = False
+                st = st.replace("[think=off]", "").strip()
+
+            if "[search=on]" in st:
+                config["search_enabled"] = True
+                st = st.replace("[search=on]", "").strip()
+            elif "[search=off]" in st:
+                config["search_enabled"] = False
+                st = st.replace("[search=off]", "").strip()
+
             if st:
                 system_text = (system_text + "\n" + st).strip() if system_text else st
             continue
@@ -416,7 +435,7 @@ def build_query_from_messages(
             last_user_msg = text
 
     # 工具提示词嵌入 system 消息
-    if tools and tools_enabled:
+    if tools and config["tools_enabled"]:
         tool_prompt = build_tool_prompt(tools, passthrough=passthrough)
         if tool_prompt:
             system_text = (system_text + "\n\n" + tool_prompt).strip() if system_text else tool_prompt
@@ -430,4 +449,6 @@ def build_query_from_messages(
     if not last_user_msg:
         last_user_msg = "Please continue."
 
-    return last_user_msg, tools_enabled, full_history
+    final_query = f"[system check:- read the file recheck the content carefully twince then do whatever the context is .]\n\n{last_user_msg}"
+
+    return final_query, config, full_history

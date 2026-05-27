@@ -429,9 +429,11 @@ async def chat_completions(
 
     # 构建查询
     passthrough_mode = request.passthrough or config_manager.config.tools_passthrough
-    query, tools_enabled, full_history = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
+    query, config, full_history = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
 
-    thinking = bool(request.reasoning_effort)
+    tools_enabled = config["tools_enabled"]
+    web_search = config["search_enabled"]
+    thinking = config["think_enabled"] if config["think_enabled"] is not None else bool(request.reasoning_effort)
     client = MimoClient(account)
 
     # 会话管理：现已修改为：每次请求都创建全新的会话，确保不复用旧 chat。
@@ -476,7 +478,8 @@ async def chat_completions(
         stream_tools = tools_dict if tools_enabled else None
         return StreamingResponse(
             _stream_response(client, query, thinking, effective_model, stream_tools, multi_medias, attachments=attachments, passthrough=passthrough_mode,
-                             conv_id=conv_id, account_id=account.user_id, tools_enabled=tools_enabled),
+                             conv_id=conv_id, account_id=account.user_id, tools_enabled=tools_enabled,
+                             web_search=web_search, temperature=request.temperature or 0.8, top_p=request.top_p or 0.95),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -488,7 +491,8 @@ async def chat_completions(
     # 非流式响应
     try:
         content, think_content, usage = await client.call_api(
-            query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled)
+            query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled,
+            web_search=web_search, temperature=request.temperature or 0.8, top_p=request.top_p or 0.95)
 
         # 保存用量
         if usage:
@@ -551,6 +555,9 @@ async def _stream_response(
     passthrough: bool = False,
     conv_id: str = None, account_id: str = None,
     tools_enabled: bool = False,
+    web_search: bool = False,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
 ):
     """流式响应生成器。
 
@@ -590,7 +597,7 @@ async def _stream_response(
             buffer = ""
             last_usage = None
 
-            async for sse_data in client.stream_api(query, thinking, model, multi_medias, attachments=attachments, tools_enabled=tools_enabled):
+            async for sse_data in client.stream_api(query, thinking, model, multi_medias, attachments=attachments, tools_enabled=tools_enabled, web_search=web_search, temperature=temperature, top_p=top_p):
                 # 用量事件
                 if sse_data.get("type") == "usage":
                     last_usage = sse_data
@@ -696,7 +703,7 @@ async def _stream_response(
             in_think = False
             last_usage = None
 
-            async for sse_data in client.stream_api(query, thinking, model, multi_medias, attachments=attachments, tools_enabled=tools_enabled):
+            async for sse_data in client.stream_api(query, thinking, model, multi_medias, attachments=attachments, tools_enabled=tools_enabled, web_search=web_search, temperature=temperature, top_p=top_p):
                 if sse_data.get("type") == "usage":
                     last_usage = sse_data
                     continue
@@ -1422,6 +1429,8 @@ async def _do_response_chat(body: dict, account) -> tuple:
     input_data = body.get("input", [])
     instructions = body.get("instructions")
     tools = body.get("tools")
+    temperature = body.get("temperature", 0.8)
+    top_p = body.get("top_p", 0.95)
     text_config = _response_text_config(body)
 
     # 转换 input 为消息列表
@@ -1462,8 +1471,10 @@ async def _do_response_chat(body: dict, account) -> tuple:
         ))
 
     # 构建查询
-    query, tools_enabled, full_history = build_query_from_messages(openai_messages, tools=tools)
-    thinking = False
+    query, config, full_history = build_query_from_messages(openai_messages, tools=tools)
+    tools_enabled = config["tools_enabled"]
+    web_search = config["search_enabled"]
+    thinking = config["think_enabled"] if config["think_enabled"] is not None else False
 
     # 提取媒体
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(openai_messages)
@@ -1503,7 +1514,8 @@ async def _do_response_chat(body: dict, account) -> tuple:
     client = MimoClient(account)
     try:
         content, think_content, usage = await client.call_api(
-            query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled
+            query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled,
+            web_search=web_search, temperature=temperature, top_p=top_p
         )
     except MimoApiError as e:
         raise HTTPException(
@@ -1567,6 +1579,8 @@ async def _stream_response_events(body: dict, account):
     input_data = body.get("input", [])
     instructions = body.get("instructions")
     tools = body.get("tools")
+    temperature = body.get("temperature", 0.8)
+    top_p = body.get("top_p", 0.95)
     text_config = _response_text_config(body)
 
     # 转换 input 为消息列表（同非流式）
@@ -1601,8 +1615,10 @@ async def _stream_response_events(body: dict, account):
 
     # 构建查询
     tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
-    query, tools_enabled, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
-    thinking = False
+    query, config, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
+    tools_enabled = config["tools_enabled"]
+    web_search = config["search_enabled"]
+    thinking = config["think_enabled"] if config["think_enabled"] is not None else False
 
     # 会话管理
     conv_id = uuid.uuid4().hex[:32]
@@ -1694,7 +1710,7 @@ async def _stream_response_events(body: dict, account):
             # 仅在启用工具时传递工具名进行清理
             clean_tools = get_tool_names(tools_dict) if tools_enabled else None
 
-            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled):
+            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled, web_search=web_search, temperature=temperature, top_p=top_p):
                 if sse_data.get("type") == "usage":
                     continue
                 chunk = sse_data.get("content", "")
@@ -1920,7 +1936,7 @@ async def _stream_response_events(body: dict, account):
             # 仅在启用工具时传递工具名进行清理
             clean_tools = tools_dict if tools_enabled else None
 
-            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled):
+            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled, web_search=web_search, temperature=temperature, top_p=top_p):
                 if sse_data.get("type") == "usage":
                     continue
                 chunk = sse_data.get("content", "")
