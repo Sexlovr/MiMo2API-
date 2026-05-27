@@ -37,8 +37,10 @@ class MimoClient:
             "Content-Type": "application/json",
             "Origin": "https://aistudio.xiaomimimo.com",
             "Referer": "https://aistudio.xiaomimimo.com/",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36",
             "x-timezone": "Asia/Shanghai",
+            "sec-ch-ua-mobile": "?1",
+            "sec-ch-ua-platform": "Android",
         }
 
     def _create_cookies(self) -> dict:
@@ -55,6 +57,7 @@ class MimoClient:
             "msgId": uuid.uuid4().hex[:32],
             "conversationId": conversation_id or uuid.uuid4().hex[:32],
             "query": query,
+            "isEditedQuery": False,
             "modelConfig": {
                 "enableThinking": thinking,
                 "temperature": 0.8,

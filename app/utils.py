@@ -372,36 +372,23 @@ def build_query_from_messages(
     messages: list,
     tools: list = None,
     passthrough: bool = False,
-) -> Tuple[str, bool]:
-    """从消息列表构建查询字符串。
+) -> Tuple[str, bool, str]:
+    """从消息列表构建查询。
+    现已修改为支持文件上下文策略。
 
     Returns:
-        (query_string, tools_enabled)
+        (last_user_message, tools_enabled, full_history_string)
     """
     from .tool_call import build_tool_prompt
 
-    query_parts = []
+    history_parts = []
     system_text = ""
     tools_enabled = False
+    last_user_msg = ""
 
     for msg in messages:
-        role = msg.role
-        content = msg.content or ""
-
-        if role == "system":
-            if isinstance(content, list):
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text_parts.append(item.get("text", ""))
-                content = " ".join(text_parts)
-            st = str(content).strip()
-            if "[tool=on]" in st:
-                tools_enabled = True
-                st = st.replace("[tool=on]", "").strip()
-            if st:
-                system_text = (system_text + "\n" + st).strip() if system_text else st
-            continue
+        role = getattr(msg, 'role', 'user')
+        content = getattr(msg, 'content', '') or ""
 
         if isinstance(content, list):
             text_parts = []
@@ -410,28 +397,43 @@ def build_query_from_messages(
                     text_parts.append(item.get("text", ""))
             content = " ".join(text_parts)
 
+        if role == "system":
+            st = str(content).strip()
+            if "[tool=on]" in st:
+                tools_enabled = True
+                st = st.replace("[tool=on]", "").strip()
+            if st:
+                system_text = (system_text + "\n" + st).strip() if system_text else st
+            continue
+
+        text = str(content)
         if hasattr(msg, 'tool_calls') and msg.tool_calls:
-            content = _serialize_tool_calls(msg.tool_calls)
+            text = _serialize_tool_calls(msg.tool_calls)
 
         if role == "tool":
             tool_call_id = getattr(msg, 'tool_call_id', '') or ''
-            clean = re.sub(r'\[TOOL_RESULT\]\s*', '', content, flags=re.IGNORECASE)
-            clean = clean.strip()
-            content = f"[tool_result id={tool_call_id[:8]}] {clean}"
+            clean = re.sub(r'\[TOOL_RESULT\]\s*', '', text, flags=re.IGNORECASE).strip()
+            text = f"[tool_result id={tool_call_id[:8]}] {clean}"
 
-        query_parts.append(f"{role}: {content}")
+        history_parts.append(f"{role}: {text}")
+        if role == "user":
+            last_user_msg = text
 
     # 工具提示词嵌入 system 消息
     if tools and tools_enabled:
         tool_prompt = build_tool_prompt(tools, passthrough=passthrough)
         if tool_prompt:
-            if system_text:
-                system_text = system_text + "\n\n" + tool_prompt
-            else:
-                system_text = tool_prompt
+            system_text = (system_text + "\n\n" + tool_prompt).strip() if system_text else tool_prompt
 
-    # system 消息插入最前面
     if system_text:
-        query_parts.insert(0, f"system: {system_text}")
+        history_parts.insert(0, f"system: {system_text}")
 
-    return "\n".join(query_parts), tools_enabled
+    full_history = "\n".join(history_parts)
+
+    # 最终发送给 MiMo 的主 query 提示
+    if not last_user_msg:
+        last_user_msg = "Please continue."
+
+    final_query = f"[Important: Read the attached history file to understand our conversation. Then respond to my last message below.]\n\nUser: {last_user_msg}"
+
+    return final_query, tools_enabled, full_history
