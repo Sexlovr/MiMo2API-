@@ -7,6 +7,9 @@ import re
 import hashlib
 import json as _json
 import httpx
+import asyncio
+import base64 as b64
+import uuid
 from typing import Optional, List, Tuple, Dict, Any
 from .config import MimoAccount
 
@@ -166,9 +169,7 @@ async def upload_text_file_to_mimo(
     if "," in base64_data:
         base64_data = base64_data.split(",", 1)[1]
 
-    import base64 as b64
     binary_data = b64.b64decode(base64_data)
-
     md5 = hashlib.md5(binary_data).hexdigest()
 
     cookie = f"serviceToken={account.service_token}; userId={account.user_id}; xiaomichatbot_ph={account.xiaomichatbot_ph}"
@@ -225,13 +226,12 @@ async def upload_text_file_to_mimo(
                     data = resp.json()
                     if data.get("code") == 0 and data.get("data", {}).get("id"):
                         parse_res = data
-                        import asyncio
-                        await asyncio.sleep(3)
+                        # 给 MiMo 索引一点点时间，但不阻塞太久
+                        await asyncio.sleep(0.5)
                         break
                 except Exception:
                     pass
-                import asyncio
-                await asyncio.sleep(2)
+                await asyncio.sleep(1.5)
 
             if not parse_res:
                 print("[uploadTextFile] Parse failed after retries")
@@ -269,11 +269,9 @@ async def upload_media_to_mimo(
     if "," in base64_data:
         base64_data = base64_data.split(",", 1)[1]
 
-    import base64 as b64
     binary_data = b64.b64decode(base64_data)
-
     md5 = hashlib.md5(binary_data).hexdigest()
-    import uuid
+
     ext = mime_type.split("/")[-1] if "/" in mime_type else "jpg"
     if ext == "jpeg":
         ext = "jpg"
@@ -333,13 +331,11 @@ async def upload_media_to_mimo(
                     data = resp.json()
                     if data.get("code") == 0 and data.get("data", {}).get("id"):
                         parse_res = data
-                        import asyncio
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(0.5)
                         break
                 except Exception:
                     pass
-                import asyncio
-                await asyncio.sleep(2)
+                await asyncio.sleep(1.5)
 
             if not parse_res:
                 print("[uploadMedia] Parse failed after retries")
@@ -428,12 +424,10 @@ def build_query_from_messages(
     if system_text:
         history_parts.insert(0, f"system: {system_text}")
 
-    full_history = "\n".join(history_parts)
+    full_history = "[CONVERSATION HISTORY - PLEASE READ THIS FIRST]\n\n" + "\n".join(history_parts)
 
-    # 最终发送给 MiMo 的主 query 提示
+    # 最终发送给 MiMo 的主 query
     if not last_user_msg:
         last_user_msg = "Please continue."
 
-    final_query = f"[Important: Read the attached history file to understand our conversation. Then respond to my last message below.]\n\nUser: {last_user_msg}"
-
-    return final_query, tools_enabled, full_history
+    return last_user_msg, tools_enabled, full_history

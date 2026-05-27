@@ -13,6 +13,7 @@ import uuid
 import time
 import re
 import httpx
+import asyncio
 import base64 as b64
 from typing import Optional, AsyncIterator
 
@@ -190,6 +191,8 @@ async def _anthropic_stream_think_wrapper(
     model: str,
     msg_id: str,
     tool_names: list = None,
+    client: MimoClient = None,
+    conv_id: str = None,
 ) -> AsyncIterator[str]:
     """
     将 MiMo 的流式事件（含 <think> 标签 + 可能含 TOOL_CALL）实时转换为 Anthropic SSE 事件。
@@ -387,6 +390,10 @@ async def _anthropic_stream_think_wrapper(
     yield _make_message_delta(stop_reason)
     yield _make_message_stop()
 
+    # Stateless 策略：用完即焚
+    if client and conv_id:
+        asyncio.create_task(client.delete_conversations([conv_id]))
+
 
 # ─── /v1/messages ────────────────────────────────────────────
 
@@ -469,26 +476,30 @@ async def anthropic_messages(
 
     # 上传到 MiMo CDN
     # 文件上下文策略
-    import base64 as b64_std
-    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, model)
+    history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, model)
 
-    multi_medias = [media_obj] if media_obj else []
+    multi_medias = []
+    attachments = []
+    if history_media_obj:
+        multi_medias.append(history_media_obj)
+        attachments.append(history_media_obj)
+
     if base64_medias:
         for media in base64_medias:
-            media_obj = await upload_media_to_mimo(
+            m_obj = await upload_media_to_mimo(
                 media["base64"], media["mimeType"], account, model
             )
-            if media_obj:
-                multi_medias.append(media_obj)
+            if m_obj:
+                multi_medias.append(m_obj)
 
     if text_files:
         for tf in text_files:
-            media_obj = await upload_text_file_to_mimo(
+            m_obj = await upload_text_file_to_mimo(
                 tf["base64"], tf["filename"], tf["mimeType"], account, model
             )
-            if media_obj:
-                multi_medias.append(media_obj)
+            if m_obj:
+                multi_medias.append(m_obj)
 
     # ── 会话管理 ──
     conv_id, conv_is_new = _get_or_create_session(
@@ -505,9 +516,10 @@ async def anthropic_messages(
     # ═══════════════════════════════════════════════════════════
     if stream:
         async def _wrap():
-            mimo_gen = client.stream_api(query, False, model, multi_medias=multi_medias, conversation_id=conv_id, tools_enabled=tools_enabled)
+            mimo_gen = client.stream_api(query, False, model, multi_medias=multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled)
             async for event in _anthropic_stream_think_wrapper(
                 mimo_gen, model, msg_id, tool_names=tool_names,
+                client=client, conv_id=conv_id,
             ):
                 yield event
 
@@ -525,7 +537,7 @@ async def anthropic_messages(
     # ═══════════════════════════════════════════════════════════
     try:
         content, think_content, usage = await client.call_api(
-            query, False, model, multi_medias=multi_medias, conversation_id=conv_id, tools_enabled=tools_enabled,
+            query, False, model, multi_medias=multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled,
         )
 
         # 保存用量
@@ -545,6 +557,9 @@ async def anthropic_messages(
                     tool_calls = result[0]
                 if result[1] is not None:
                     content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
+
+        # Stateless 策略：用完即焚
+        asyncio.create_task(client.delete_conversations([conv_id]))
 
         # 构建 OpenAI 格式的非流式响应
         message = {"role": "assistant", "content": content}
@@ -661,7 +676,6 @@ async def anthropic_create_batch_ep(request: Request):
         except Exception as e:
             return _anthropic_error_response(str(e)[:500], "api_error")
 
-    import asyncio
     asyncio.create_task(_anthropic_process_batch_requests(batch["id"], _process_one))
     return batch
 

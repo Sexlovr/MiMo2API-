@@ -9,6 +9,7 @@ import json
 import asyncio
 import re
 import httpx
+import base64 as b64_std
 from typing import Optional, Tuple
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Header, Request
@@ -439,18 +440,42 @@ async def chat_completions(
     )
 
     # 文件上下文策略：将 full_history 上传为 txt
-    import base64 as b64_std
     history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
     history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, request.model)
-    # 立即用当前消息更新指纹（对新会话：设置初值；对已有会话：更新续接后的指纹）
-    _update_session_fingerprint(account.user_id, conv_id, request.messages)
+
+    effective_model = request.model
+    # 将历史文件加入媒体列表
+    multi_medias = []
+    attachments = []
+    if history_media_obj:
+        multi_medias.append(history_media_obj)
+        attachments.append(history_media_obj)
+
+    # 提取媒体和文本文件
+    query_text_unused, base64_medias, text_files, processed_msgs = extract_medias_from_messages(request.messages)
+
+    if base64_medias:
+        for media in base64_medias:
+            media_obj = await upload_media_to_mimo(
+                media["base64"], media["mimeType"], account, effective_model
+            )
+            if media_obj:
+                multi_medias.append(media_obj)
+
+    if text_files:
+        for tf in text_files:
+            media_obj = await upload_text_file_to_mimo(
+                tf["base64"], tf["filename"], tf["mimeType"], account, effective_model
+            )
+            if media_obj:
+                multi_medias.append(media_obj)
 
     # 流式响应
     if request.stream:
         # 如果没有 [tool=on]，则即使有 tools 也视为没有，禁用 sieve
         stream_tools = tools_dict if tools_enabled else None
         return StreamingResponse(
-            _stream_response(client, query, thinking, effective_model, stream_tools, multi_medias, passthrough=passthrough_mode,
+            _stream_response(client, query, thinking, effective_model, stream_tools, multi_medias, attachments=attachments, passthrough=passthrough_mode,
                              conv_id=conv_id, account_id=account.user_id, tools_enabled=tools_enabled),
             media_type="text/event-stream",
             headers={
@@ -463,7 +488,7 @@ async def chat_completions(
     # 非流式响应
     try:
         content, think_content, usage = await client.call_api(
-            query, thinking, effective_model, multi_medias, conversation_id=conv_id, tools_enabled=tools_enabled)
+            query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled)
 
         # 保存用量
         if usage:
@@ -493,6 +518,9 @@ async def chat_completions(
             # 清洗工具名前缀
             content = _strip_tool_name_prefix(content, tool_names)
 
+        # 立即删除 MiMo 服务端会话（Stateless 策略：用完即焚）
+        asyncio.create_task(client.delete_conversations([conv_id]))
+
         if tool_calls:
             return _build_response(
                 msg_id, request.model,
@@ -519,6 +547,7 @@ async def chat_completions(
 async def _stream_response(
     client: MimoClient, query: str, thinking: bool, model: str,
     tools: list = None, multi_medias: list = None,
+    attachments: list = None,
     passthrough: bool = False,
     conv_id: str = None, account_id: str = None,
     tools_enabled: bool = False,
@@ -561,7 +590,7 @@ async def _stream_response(
             buffer = ""
             last_usage = None
 
-            async for sse_data in client.stream_api(query, thinking, model, multi_medias, tools_enabled=tools_enabled):
+            async for sse_data in client.stream_api(query, thinking, model, multi_medias, attachments=attachments, tools_enabled=tools_enabled):
                 # 用量事件
                 if sse_data.get("type") == "usage":
                     last_usage = sse_data
@@ -667,7 +696,7 @@ async def _stream_response(
             in_think = False
             last_usage = None
 
-            async for sse_data in client.stream_api(query, thinking, model, multi_medias, tools_enabled=tools_enabled):
+            async for sse_data in client.stream_api(query, thinking, model, multi_medias, attachments=attachments, tools_enabled=tools_enabled):
                 if sse_data.get("type") == "usage":
                     last_usage = sse_data
                     continue
@@ -738,15 +767,12 @@ async def _stream_response(
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as e:
-        # import traceback
-        # tb = traceback.format_exc()
-        # log_path = Path(__file__).parent.parent / "error.log"
-        # if log_path.exists() and log_path.stat().st_size > 2 * 1024 * 1024:
-        #     log_path.write_text('')
-        # with open(log_path, "a") as f:
-        #     f.write(f"=== STREAM ERROR ===\n{tb}\n\n")
         yield f"data: {json.dumps({'error': {'message': str(e)}})}\n\n"
         yield "data: [DONE]\n\n"
+    finally:
+        # Stateless 策略：流结束后立即删除会话
+        if client and conv_id:
+            asyncio.create_task(client.delete_conversations([conv_id]))
 
 
 # ─── 管理页面 ─────────────────────────────────────────────────
@@ -1435,11 +1461,28 @@ async def _do_response_chat(body: dict, account) -> tuple:
             tool_call_id=m.get("tool_call_id"),
         ))
 
+    # 构建查询
+    query, tools_enabled, full_history = build_query_from_messages(openai_messages, tools=tools)
+    thinking = False
+
     # 提取媒体
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(openai_messages)
     effective_model = model
 
-    multi_medias = [history_media_obj] if history_media_obj else []
+    # 会话管理
+    conv_id = uuid.uuid4().hex[:32]
+    body["_conv_id"] = conv_id
+
+    # 文件上下文策略
+    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
+
+    multi_medias = []
+    attachments = []
+    if history_media_obj:
+        multi_medias.append(history_media_obj)
+        attachments.append(history_media_obj)
+
     if base64_medias:
         for media in base64_medias:
             media_obj = await upload_media_to_mimo(
@@ -1455,26 +1498,12 @@ async def _do_response_chat(body: dict, account) -> tuple:
             if media_obj:
                 multi_medias.append(media_obj)
 
-    # 构建 tools dict
-    tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
-
-    # 构建查询
-    query, tools_enabled, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
-
-    thinking = False
-
-    # 文件上下文策略
-    import base64 as b64_std
-    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
-    if history_media:
-        multi_medias.insert(0, history_media)
 
     # 调用 MimoClient
     client = MimoClient(account)
     try:
         content, think_content, usage = await client.call_api(
-            query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled
+            query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled
         )
     except MimoApiError as e:
         raise HTTPException(
@@ -1519,6 +1548,9 @@ async def _do_response_chat(body: dict, account) -> tuple:
 
     if not items:
         items.append(_response_text_item(""))
+
+    # 立即删除 MiMo 服务端会话
+    asyncio.create_task(client.delete_conversations([body.get("_conv_id", "")]))
 
     return effective_model, usage, items
 
@@ -1567,10 +1599,29 @@ async def _stream_response_events(body: dict, account):
             tool_call_id=m.get("tool_call_id"),
         ))
 
+    # 构建查询
+    tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
+    query, tools_enabled, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
+    thinking = False
+
+    # 会话管理
+    conv_id = uuid.uuid4().hex[:32]
+    body["_conv_id"] = conv_id
+
+    # 文件上下文策略
+    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, model)
+
+    multi_medias = []
+    attachments = []
+    if history_media:
+        multi_medias.append(history_media)
+        attachments.append(history_media)
+
+    # 提取媒体
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(openai_messages)
     effective_model = model
 
-    multi_medias = []
     if base64_medias:
         for media in base64_medias:
             media_obj = await upload_media_to_mimo(
@@ -1585,17 +1636,6 @@ async def _stream_response_events(body: dict, account):
             )
             if media_obj:
                 multi_medias.append(media_obj)
-
-    tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
-    query, tools_enabled, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
-    thinking = False
-
-    # 文件上下文策略
-    import base64 as b64_std
-    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
-    if history_media:
-        multi_medias.insert(0, history_media)
 
     response_id = body.get("_response_id") or _gen_response_id()
     created_t = int(time.time())
@@ -2136,6 +2176,10 @@ async def _stream_response_events(body: dict, account):
         failed_payload["status"] = "failed"
         failed_payload["error"] = {"message": str(e)[:500], "type": "server_error"}
         yield {"type": "response.failed", "response": failed_payload}
+    finally:
+        # Stateless 策略：流结束后立即删除会话
+        if client and body.get("_conv_id"):
+            asyncio.create_task(client.delete_conversations([body["_conv_id"]]))
 
 
 async def _sse_stream_response(body: dict, account):
@@ -2178,6 +2222,7 @@ async def create_response(
 
     # 非流式
     try:
+        # 非流式逻辑在 _do_response_chat 中已包含删除任务
         model_used, usage, items = await _do_response_chat(body, account)
     except HTTPException:
         raise
