@@ -7,9 +7,9 @@ import time
 import uuid
 import json
 import asyncio
+import base64 as b64
 import re
 import httpx
-import base64 as b64_std
 from typing import Optional, Tuple
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Header, Request
@@ -214,14 +214,14 @@ def _strip_tool_result_blocks(text: str) -> str:
     cleaned = re.sub(r'\[tool_result\s+id=\S+\]\s*', '', cleaned, flags=re.IGNORECASE)
     # XML 格式: <tool_result>...</tool_result>（模型学会的另一种格式）
     cleaned = re.sub(r'</?tool_result>\s*', '', cleaned, flags=re.IGNORECASE)
-    return cleaned
+    return cleaned.strip()
 
 
 def _strip_citations(text: str) -> str:
     """移除 MiMo 模型输出的引用标记，如 (citation:1)(citation:14)。"""
     if not text:
         return text
-    return re.sub(r'\(citation:\d+\)\s*', '', text)
+    return re.sub(r'\(citation:\d+\)\s*', '', text).strip()
 
 
 def _camel_case(name: str) -> str:
@@ -243,8 +243,8 @@ def _strip_tool_name_prefix(text: str, tool_names: list) -> str:
         if '_' in n:
             variants.append(re.escape(_camel_case(n)))
     escaped = '|'.join(variants)
-    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text, flags=re.IGNORECASE)
-    return cleaned
+    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text.strip(), flags=re.IGNORECASE)
+    return cleaned.strip()
 
 
 def _strip_mimo_prefix(text: str) -> str:
@@ -258,18 +258,18 @@ def _strip_mimo_prefix(text: str) -> str:
                 'imageSearch', 'fileSearch', 'getLocation', 'webExtract',
                 'getWeather', 'calculator']
     escaped = '|'.join(re.escape(p) for p in prefixes)
-    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text, flags=re.IGNORECASE)
-    return cleaned
+    cleaned = re.sub(rf'^({escaped})\s*\n?', '', text.strip(), flags=re.IGNORECASE)
+    return cleaned.strip()
 
 
 def _clean_response_text(text: str, tool_names: list = None) -> str:
-    """综合文本清理管道：引用 + (仅在启用工具时) MiMo前缀 + TOOL_RESULT + 工具前缀 + 工具文本残留。"""
+    """综合文本清理管道：TOOL_RESULT + 引用 + 工具前缀 + MiMo前缀 + 工具文本残留。"""
+    text = _strip_tool_result_blocks(text)
     text = _strip_citations(text)
     if tool_names:
-        text = _strip_mimo_prefix(text)
-        text = _strip_tool_result_blocks(text)
         text = _strip_tool_name_prefix(text, tool_names)
-        text = clean_tool_text(text)
+    text = _strip_mimo_prefix(text)
+    text = clean_tool_text(text)
     return text
 
 
@@ -405,28 +405,6 @@ async def chat_completions(
     # 转换 tools 为字典列表
     tools_dict = [t.dict() if hasattr(t, 'dict') else t for t in request.tools] if request.tools else None
 
-    # 提取媒体和文本文件
-    query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(request.messages)
-    effective_model = request.model
-
-    multi_medias = []
-    if base64_medias:
-        for media in base64_medias:
-            media_obj = await upload_media_to_mimo(
-                media["base64"], media["mimeType"], account, effective_model
-            )
-            if media_obj:
-                multi_medias.append(media_obj)
-
-    # 上传文本文件到 MiMo（同样走 multiMedias，mediaType="file"）
-    if text_files:
-        for tf in text_files:
-            media_obj = await upload_text_file_to_mimo(
-                tf["base64"], tf["filename"], tf["mimeType"], account, effective_model
-            )
-            if media_obj:
-                multi_medias.append(media_obj)
-
     # 构建查询
     passthrough_mode = request.passthrough or config_manager.config.tools_passthrough
     query, config, full_history = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
@@ -436,26 +414,26 @@ async def chat_completions(
     thinking = config["think_enabled"] if config["think_enabled"] is not None else bool(request.reasoning_effort)
     client = MimoClient(account)
 
-    # 会话管理：现已修改为：每次请求都创建全新的会话，确保不复用旧 chat。
+    # 会话管理：每次请求都创建全新的会话
     conv_id, conv_is_new = _get_or_create_session(
         account.user_id, request.messages, request.model
     )
 
-    # 文件上下文策略：将 full_history 上传为 txt
-    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, request.model)
-
+    # 提取媒体和文本文件
+    query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(request.messages)
     effective_model = request.model
-    # 将历史文件加入媒体列表
+
     multi_medias = []
     attachments = []
+
+    # 1. 文件上下文策略：将 full_history 上传为 txt
+    history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
     if history_media_obj:
         multi_medias.append(history_media_obj)
         attachments.append(history_media_obj)
 
-    # 提取媒体和文本文件
-    query_text_unused, base64_medias, text_files, processed_msgs = extract_medias_from_messages(request.messages)
-
+    # 2. 用户上传的媒体
     if base64_medias:
         for media in base64_medias:
             media_obj = await upload_media_to_mimo(
@@ -463,7 +441,9 @@ async def chat_completions(
             )
             if media_obj:
                 multi_medias.append(media_obj)
+                attachments.append(media_obj)
 
+    # 3. 用户上传的文本文件
     if text_files:
         for tf in text_files:
             media_obj = await upload_text_file_to_mimo(
@@ -471,15 +451,27 @@ async def chat_completions(
             )
             if media_obj:
                 multi_medias.append(media_obj)
+                attachments.append(media_obj)
 
     # 流式响应
     if request.stream:
         # 如果没有 [tool=on]，则即使有 tools 也视为没有，禁用 sieve
         stream_tools = tools_dict if tools_enabled else None
+
+        async def _wrap_gen():
+            try:
+                async for chunk in _stream_response(
+                    client, query, thinking, effective_model, stream_tools, multi_medias, attachments=attachments, passthrough=passthrough_mode,
+                    conv_id=conv_id, account_id=account.user_id, tools_enabled=tools_enabled,
+                    web_search=web_search, temperature=request.temperature or 0.8, top_p=request.top_p or 0.95
+                ):
+                    yield chunk
+            finally:
+                if client and conv_id:
+                    asyncio.create_task(client.delete_conversations([conv_id]))
+
         return StreamingResponse(
-            _stream_response(client, query, thinking, effective_model, stream_tools, multi_medias, attachments=attachments, passthrough=passthrough_mode,
-                             conv_id=conv_id, account_id=account.user_id, tools_enabled=tools_enabled,
-                             web_search=web_search, temperature=request.temperature or 0.8, top_p=request.top_p or 0.95),
+            _wrap_gen(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
@@ -490,9 +482,13 @@ async def chat_completions(
 
     # 非流式响应
     try:
-        content, think_content, usage = await client.call_api(
-            query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled,
-            web_search=web_search, temperature=request.temperature or 0.8, top_p=request.top_p or 0.95)
+        try:
+            content, think_content, usage = await client.call_api(
+                query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled,
+                web_search=web_search, temperature=request.temperature or 0.8, top_p=request.top_p or 0.95)
+        finally:
+            if client and conv_id:
+                asyncio.create_task(client.delete_conversations([conv_id]))
 
         # 保存用量
         if usage:
@@ -502,15 +498,17 @@ async def chat_completions(
         # 首次消息：记录真实指纹
         _update_session_fingerprint(account.user_id, conv_id, request.messages)
 
-        # 清理模型输出
-        content = _clean_response_text(content, tool_names=(get_tool_names(tools_dict) if tools_enabled else None))
+        # 清理模型输出杂质
+        content = _strip_tool_result_blocks(content)
+        content = _strip_citations(content)
+        content = clean_tool_text(content)
 
         msg_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         # 提取工具调用
         tool_names = []
         tool_calls = None
-        if tools_dict and tools_enabled:
+        if tools_dict:
             tool_names = get_tool_names(tools_dict)
             result = extract_tool_call(content, tool_names)
             if result:
@@ -519,11 +517,8 @@ async def chat_completions(
                 if result[1] is not None:
                     content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
 
-            # 清洗工具名前缀
-            content = _strip_tool_name_prefix(content, tool_names)
-
-        # 立即删除 MiMo 服务端会话（Stateless 策略：用完即焚）
-        asyncio.create_task(client.delete_conversations([conv_id]))
+        # 清洗工具名前缀
+        content = _strip_tool_name_prefix(content, tool_names)
 
         if tool_calls:
             return _build_response(
@@ -719,7 +714,7 @@ async def _stream_response(
                         if idx != -1:
                             safe, keep = _safe_flush(buffer[:idx])
                             if safe:
-                                clean = _clean_response_text(safe, tool_names=None)
+                                clean = _clean_response_text(safe)
                                 if clean:
                                     yield _build_chunk(msg_id, model, created=created_t, content=clean)
                             in_think = True
@@ -728,7 +723,7 @@ async def _stream_response(
 
                         safe, keep = _safe_flush(buffer)
                         if safe:
-                            clean = _clean_response_text(safe, tool_names=None)
+                            clean = _clean_response_text(safe)
                             if clean:
                                 yield _build_chunk(msg_id, model, created=created_t, content=clean)
                         buffer = keep
@@ -751,7 +746,7 @@ async def _stream_response(
 
             # 发送剩余内容
             if buffer:
-                clean = _clean_response_text(buffer, tool_names=None)
+                clean = _clean_response_text(buffer)
                 if clean:
                     if in_think:
                         yield _build_chunk(msg_id, model, created=created_t, reasoning=clean)
@@ -774,12 +769,15 @@ async def _stream_response(
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as e:
+        # import traceback
+        # tb = traceback.format_exc()
+        # log_path = Path(__file__).parent.parent / "error.log"
+        # if log_path.exists() and log_path.stat().st_size > 2 * 1024 * 1024:
+        #     log_path.write_text('')
+        # with open(log_path, "a") as f:
+        #     f.write(f"=== STREAM ERROR ===\n{tb}\n\n")
         yield f"data: {json.dumps({'error': {'message': str(e)}})}\n\n"
         yield "data: [DONE]\n\n"
-    finally:
-        # Stateless 策略：流结束后立即删除会话
-        if client and conv_id:
-            asyncio.create_task(client.delete_conversations([conv_id]))
 
 
 # ─── 管理页面 ─────────────────────────────────────────────────
@@ -1429,8 +1427,6 @@ async def _do_response_chat(body: dict, account) -> tuple:
     input_data = body.get("input", [])
     instructions = body.get("instructions")
     tools = body.get("tools")
-    temperature = body.get("temperature", 0.8)
-    top_p = body.get("top_p", 0.95)
     text_config = _response_text_config(body)
 
     # 转换 input 为消息列表
@@ -1470,30 +1466,27 @@ async def _do_response_chat(body: dict, account) -> tuple:
             tool_call_id=m.get("tool_call_id"),
         ))
 
-    # 构建查询
-    query, config, full_history = build_query_from_messages(openai_messages, tools=tools)
-    tools_enabled = config["tools_enabled"]
-    web_search = config["search_enabled"]
-    thinking = config["think_enabled"] if config["think_enabled"] is not None else False
-
     # 提取媒体
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(openai_messages)
     effective_model = model
 
-    # 会话管理
-    conv_id = uuid.uuid4().hex[:32]
-    body["_conv_id"] = conv_id
+    # 构建 tools dict
+    tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
 
-    # 文件上下文策略
-    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
+    # 构建查询
+    query, config, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
 
     multi_medias = []
     attachments = []
+
+    # 1. 文件上下文策略：将 full_history 上传为 txt
+    history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
     if history_media_obj:
         multi_medias.append(history_media_obj)
         attachments.append(history_media_obj)
 
+    # 2. 用户上传的媒体
     if base64_medias:
         for media in base64_medias:
             media_obj = await upload_media_to_mimo(
@@ -1501,6 +1494,9 @@ async def _do_response_chat(body: dict, account) -> tuple:
             )
             if media_obj:
                 multi_medias.append(media_obj)
+                attachments.append(media_obj)
+
+    # 3. 用户上传的文本文件
     if text_files:
         for tf in text_files:
             media_obj = await upload_text_file_to_mimo(
@@ -1508,15 +1504,26 @@ async def _do_response_chat(body: dict, account) -> tuple:
             )
             if media_obj:
                 multi_medias.append(media_obj)
+                attachments.append(media_obj)
+    tools_enabled = config["tools_enabled"]
+    web_search = config["search_enabled"]
+    thinking = config["think_enabled"] if config["think_enabled"] is not None else False
 
+    # 会话管理：每次请求都创建全新的会话
+    conv_id, _ = _get_or_create_session(account.user_id, openai_messages, effective_model)
 
     # 调用 MimoClient
     client = MimoClient(account)
     try:
-        content, think_content, usage = await client.call_api(
-            query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled,
-            web_search=web_search, temperature=temperature, top_p=top_p
-        )
+        try:
+            content, think_content, usage = await client.call_api(
+                query, thinking, effective_model, multi_medias, attachments=attachments,
+                conversation_id=conv_id, tools_enabled=tools_enabled,
+                web_search=web_search
+            )
+        finally:
+            if client and conv_id:
+                asyncio.create_task(client.delete_conversations([conv_id]))
     except MimoApiError as e:
         raise HTTPException(
             status_code=e.status_code,
@@ -1528,7 +1535,24 @@ async def _do_response_chat(body: dict, account) -> tuple:
         raise HTTPException(status_code=500, detail={"error": {"message": str(e)}})
 
     # 清理输出
-    content = _clean_response_text(content, tool_names=(get_tool_names(tools_dict) if tools_enabled else None))
+    content = _strip_tool_result_blocks(content)
+    content = _strip_citations(content)
+    content = clean_tool_text(content)
+
+    # 额外处理：模型可能输出多个 think 块，_parse_think_tags 只剥除了第一个
+    remaining_thinks = []
+    cleaned_content = re.sub(
+        r'<think>(.*?)</think>',
+        lambda m: remaining_thinks.append(m.group(1).strip()) or '',
+        content,
+        flags=re.DOTALL
+    )
+    # 过滤空 think 块（模型可能输出 <think></think>）
+    remaining_thinks = [t for t in remaining_thinks if t]
+    if remaining_thinks:
+        content = cleaned_content.strip()
+        extra_think = '\n'.join(remaining_thinks)
+        think_content = (think_content + '\n' + extra_think).strip() if think_content else extra_think
 
     # 构建 items
     items = []
@@ -1540,7 +1564,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
     # 工具调用提取
     tool_names = []
     tool_calls = None
-    if tools_dict and tools_enabled:
+    if tools_dict:
         tool_names = get_tool_names(tools_dict)
         result = extract_tool_call(content, tool_names)
         if result:
@@ -1549,7 +1573,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
             if result[1] is not None:
                 content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
 
-        content = _strip_tool_name_prefix(content, tool_names)
+    content = _strip_tool_name_prefix(content, tool_names)
 
     if tool_calls:
         for tc in tool_calls:
@@ -1560,9 +1584,6 @@ async def _do_response_chat(body: dict, account) -> tuple:
 
     if not items:
         items.append(_response_text_item(""))
-
-    # 立即删除 MiMo 服务端会话
-    asyncio.create_task(client.delete_conversations([body.get("_conv_id", "")]))
 
     return effective_model, usage, items
 
@@ -1579,8 +1600,6 @@ async def _stream_response_events(body: dict, account):
     input_data = body.get("input", [])
     instructions = body.get("instructions")
     tools = body.get("tools")
-    temperature = body.get("temperature", 0.8)
-    top_p = body.get("top_p", 0.95)
     text_config = _response_text_config(body)
 
     # 转换 input 为消息列表（同非流式）
@@ -1613,31 +1632,23 @@ async def _stream_response_events(body: dict, account):
             tool_call_id=m.get("tool_call_id"),
         ))
 
-    # 构建查询
-    tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
-    query, config, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
-    tools_enabled = config["tools_enabled"]
-    web_search = config["search_enabled"]
-    thinking = config["think_enabled"] if config["think_enabled"] is not None else False
-
-    # 会话管理
-    conv_id = uuid.uuid4().hex[:32]
-    body["_conv_id"] = conv_id
-
-    # 文件上下文策略
-    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
-    history_media = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, model)
-
-    multi_medias = []
-    attachments = []
-    if history_media:
-        multi_medias.append(history_media)
-        attachments.append(history_media)
-
-    # 提取媒体
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(openai_messages)
     effective_model = model
 
+    tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
+    query, config, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
+
+    multi_medias = []
+    attachments = []
+
+    # 1. 文件上下文策略：将 full_history 上传为 txt
+    history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
+    if history_media_obj:
+        multi_medias.append(history_media_obj)
+        attachments.append(history_media_obj)
+
+    # 2. 用户上传的媒体
     if base64_medias:
         for media in base64_medias:
             media_obj = await upload_media_to_mimo(
@@ -1645,6 +1656,9 @@ async def _stream_response_events(body: dict, account):
             )
             if media_obj:
                 multi_medias.append(media_obj)
+                attachments.append(media_obj)
+
+    # 3. 用户上传的文本文件
     if text_files:
         for tf in text_files:
             media_obj = await upload_text_file_to_mimo(
@@ -1652,6 +1666,10 @@ async def _stream_response_events(body: dict, account):
             )
             if media_obj:
                 multi_medias.append(media_obj)
+                attachments.append(media_obj)
+    tools_enabled = config["tools_enabled"]
+    web_search = config["search_enabled"]
+    thinking = config["think_enabled"] if config["think_enabled"] is not None else False
 
     response_id = body.get("_response_id") or _gen_response_id()
     created_t = int(time.time())
@@ -1693,9 +1711,39 @@ async def _stream_response_events(body: dict, account):
             return output_index, return_event
         return output_index, None
 
-    client = MimoClient(account)
-    has_tools = tools_dict is not None and tools_enabled
+    # 会话管理
+    conv_id, _ = _get_or_create_session(account.user_id, openai_messages, effective_model)
 
+    client = MimoClient(account)
+    has_tools = tools_dict is not None
+
+    try:
+        async def _run_stream():
+            try:
+                async for evt in _stream_response_events_inner(
+                    client, query, thinking, effective_model, multi_medias, attachments,
+                    tools_enabled, web_search, tools_dict, conv_id, text_config,
+                    message_item_id, reasoning_item_id, output_indices, output_started,
+                    tool_calls_map, reasoning_parts, text_parts, init_payload
+                ):
+                    yield evt
+            finally:
+                if client and conv_id:
+                    asyncio.create_task(client.delete_conversations([conv_id]))
+
+        async for evt in _run_stream():
+            yield evt
+
+    except Exception:
+        raise
+
+async def _stream_response_events_inner(
+    client, query, thinking, effective_model, multi_medias, attachments,
+    tools_enabled, web_search, tools_dict, conv_id, text_config,
+    message_item_id, reasoning_item_id, output_indices, output_started,
+    tool_calls_map, reasoning_parts, text_parts, init_payload
+):
+    has_tools = tools_dict is not None
     try:
         if has_tools:
             # 有工具定义：使用 StreamSieve
@@ -1707,10 +1755,7 @@ async def _stream_response_events(body: dict, account):
             in_think = False
             buffer = ""
 
-            # 仅在启用工具时传递工具名进行清理
-            clean_tools = get_tool_names(tools_dict) if tools_enabled else None
-
-            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled, web_search=web_search, temperature=temperature, top_p=top_p):
+            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled, web_search=web_search):
                 if sse_data.get("type") == "usage":
                     continue
                 chunk = sse_data.get("content", "")
@@ -1933,10 +1978,7 @@ async def _stream_response_events(body: dict, account):
             in_think = False
             buffer = ""
 
-            # 仅在启用工具时传递工具名进行清理
-            clean_tools = tools_dict if tools_enabled else None
-
-            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, tools_enabled=tools_enabled, web_search=web_search, temperature=temperature, top_p=top_p):
+            async for sse_data in client.stream_api(query, thinking, effective_model, multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled, web_search=web_search):
                 if sse_data.get("type") == "usage":
                     continue
                 chunk = sse_data.get("content", "")
@@ -1951,7 +1993,7 @@ async def _stream_response_events(body: dict, account):
                         if idx != -1:
                             safe, keep = _safe_flush(buffer[:idx])
                             if safe:
-                                clean = _clean_response_text(safe, tool_names=None)
+                                clean = _clean_response_text(safe)
                                 if clean:
                                     text_parts.append(clean)
                                     if not content_started:
@@ -1980,7 +2022,7 @@ async def _stream_response_events(body: dict, account):
 
                         safe, keep = _safe_flush(buffer)
                         if safe:
-                            clean = _clean_response_text(safe, tool_names=None)
+                            clean = _clean_response_text(safe)
                             if clean:
                                 text_parts.append(clean)
                                 if not content_started:
@@ -2046,7 +2088,7 @@ async def _stream_response_events(body: dict, account):
 
             # 发送剩余缓冲区内容
             if buffer:
-                clean = _clean_response_text(buffer, tool_names=clean_tools)
+                clean = _clean_response_text(buffer)
                 if clean:
                     if in_think:
                         reasoning_parts.append(clean)
@@ -2192,10 +2234,6 @@ async def _stream_response_events(body: dict, account):
         failed_payload["status"] = "failed"
         failed_payload["error"] = {"message": str(e)[:500], "type": "server_error"}
         yield {"type": "response.failed", "response": failed_payload}
-    finally:
-        # Stateless 策略：流结束后立即删除会话
-        if client and body.get("_conv_id"):
-            asyncio.create_task(client.delete_conversations([body["_conv_id"]]))
 
 
 async def _sse_stream_response(body: dict, account):
@@ -2238,7 +2276,6 @@ async def create_response(
 
     # 非流式
     try:
-        # 非流式逻辑在 _do_response_chat 中已包含删除任务
         model_used, usage, items = await _do_response_chat(body, account)
     except HTTPException:
         raise

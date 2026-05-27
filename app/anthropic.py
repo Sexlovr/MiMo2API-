@@ -117,6 +117,16 @@ def convert_messages(
                             "type": "image_url",
                             "image_url": {"url": source.get("url", "")}
                         })
+                elif block.get("type") == "document":
+                    source = block.get("source", {})
+                    if source.get("type") == "base64":
+                        new_blocks.append({
+                            "type": "file",
+                            "file": {
+                                "filename": block.get("title") or "document.pdf",
+                                "data": source.get("data", ""),
+                            }
+                        })
                 elif block.get("type") == "tool_result":
                     tool_results.append(block)
 
