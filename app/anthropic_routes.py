@@ -13,7 +13,6 @@ import uuid
 import time
 import re
 import httpx
-import asyncio
 import base64 as b64
 from typing import Optional, AsyncIterator
 
@@ -54,7 +53,6 @@ from .usage_store import add_usage as _add_usage
 from .routes import (
     _strip_citations, _strip_tool_result_blocks,
     _strip_tool_name_prefix, _strip_mimo_prefix, _safe_flush,
-    _clean_response_text,
     validate_api_key,
 )
 
@@ -191,8 +189,6 @@ async def _anthropic_stream_think_wrapper(
     model: str,
     msg_id: str,
     tool_names: list = None,
-    client: MimoClient = None,
-    conv_id: str = None,
 ) -> AsyncIterator[str]:
     """
     将 MiMo 的流式事件（含 <think> 标签 + 可能含 TOOL_CALL）实时转换为 Anthropic SSE 事件。
@@ -242,20 +238,21 @@ async def _anthropic_stream_think_wrapper(
         if has_tools and sieve:
             for ev in sieve.feed(buf_text):
                 if ev.type == 'text':
-                    clean = _strip_citations(ev.data)
-                    clean = _strip_mimo_prefix(clean)
-                    clean = _strip_tool_result_blocks(clean)
+                    clean = _strip_tool_result_blocks(ev.data)
+                    clean = _strip_citations(clean)
                     clean = _strip_tool_name_prefix(clean, tool_names)
+                    clean = _strip_mimo_prefix(clean)
                     clean = clean_tool_text(clean)
                     if clean:
                         events.extend(_emit_text(clean))
                 elif ev.type == 'tool_calls':
                     collected_tool_calls.extend(ev.data)
         else:
-            # 禁用工具时，仅做基础清理（如引用）
-            clean = _strip_citations(buf_text)
-            if clean:
-                events.extend(_emit_text(clean))
+            clean = _strip_tool_result_blocks(buf_text)
+            clean = _strip_citations(clean)
+            clean = _strip_mimo_prefix(clean)
+            clean = clean_tool_text(clean)
+            events.extend(_emit_text(clean))
         return events
 
     async for ev in mimo_stream:
@@ -474,32 +471,34 @@ async def anthropic_messages(
                 except Exception as e:
                     print(f"[Anthropic] failed to download image URL {url}: {e}")
 
-    # 上传到 MiMo CDN
+    multi_medias = []
+    attachments = []
+
     # 文件上下文策略
     history_b64 = b64.b64encode(full_history.encode('utf-8')).decode('utf-8')
     history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, model)
-
-    multi_medias = []
-    attachments = []
     if history_media_obj:
         multi_medias.append(history_media_obj)
         attachments.append(history_media_obj)
 
+    # 上传到 MiMo CDN
     if base64_medias:
         for media in base64_medias:
-            m_obj = await upload_media_to_mimo(
+            media_obj = await upload_media_to_mimo(
                 media["base64"], media["mimeType"], account, model
             )
-            if m_obj:
-                multi_medias.append(m_obj)
+            if media_obj:
+                multi_medias.append(media_obj)
+                attachments.append(media_obj)
 
     if text_files:
         for tf in text_files:
-            m_obj = await upload_text_file_to_mimo(
+            media_obj = await upload_text_file_to_mimo(
                 tf["base64"], tf["filename"], tf["mimeType"], account, model
             )
-            if m_obj:
-                multi_medias.append(m_obj)
+            if media_obj:
+                multi_medias.append(media_obj)
+                attachments.append(media_obj)
 
     # ── 会话管理 ──
     conv_id, conv_is_new = _get_or_create_session(
@@ -507,7 +506,7 @@ async def anthropic_messages(
     )
 
     # ── 工具名（用于后续提取） ──
-    tool_names = get_tool_names(tools_dict) if (tools_dict and tools_enabled) else None
+    tool_names = get_tool_names(tools_dict) if tools_dict else None
 
     client = MimoClient(account)
 
@@ -517,15 +516,25 @@ async def anthropic_messages(
     if stream:
         async def _wrap():
             try:
-                mimo_gen = client.stream_api(query, thinking, model, multi_medias=multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled, web_search=web_search, temperature=body.get("temperature", 0.8), top_p=body.get("top_p", 0.95))
+                mimo_gen = client.stream_api(
+                    query, thinking, model,
+                    multi_medias=multi_medias,
+                    attachments=attachments,
+                    conversation_id=conv_id,
+                    tools_enabled=tools_enabled,
+                    web_search=web_search,
+                    temperature=body.get("temperature", 0.8),
+                    top_p=body.get("top_p", 0.95)
+                )
                 async for event in _anthropic_stream_think_wrapper(
-                    mimo_gen, model, msg_id, tool_names=tool_names,
-                    client=client, conv_id=conv_id,
+                    mimo_gen, model, msg_id, tool_names=tool_names
                 ):
                     yield event
             finally:
                 # Stateless 策略：流结束后立即删除会话
                 if client and conv_id:
+                    # 使用 ensure_future 确保任务在后台运行
+                    import asyncio
                     asyncio.create_task(client.delete_conversations([conv_id]))
 
         return StreamingResponse(
@@ -542,16 +551,30 @@ async def anthropic_messages(
     # ═══════════════════════════════════════════════════════════
     try:
         content, think_content, usage = await client.call_api(
-            query, thinking, model, multi_medias=multi_medias, attachments=attachments, conversation_id=conv_id, tools_enabled=tools_enabled, web_search=web_search, temperature=body.get("temperature", 0.8), top_p=body.get("top_p", 0.95)
+            query, thinking, model,
+            multi_medias=multi_medias,
+            attachments=attachments,
+            conversation_id=conv_id,
+            tools_enabled=tools_enabled,
+            web_search=web_search,
+            temperature=body.get("temperature", 0.8),
+            top_p=body.get("top_p", 0.95)
         )
+    finally:
+        # 非流式模式：请求完成后立即删除会话
+        if client and conv_id:
+            import asyncio
+            asyncio.create_task(client.delete_conversations([conv_id]))
 
+    try:
         # 保存用量
         if usage:
             _add_usage(model, usage.get("promptTokens", 0), usage.get("completionTokens", 0))
             _update_session_tokens(account.user_id, conv_id, usage.get("promptTokens", 0))
 
         # 清理模型输出
-        content = _clean_response_text(content, tool_names=tool_names)
+        content = _strip_tool_result_blocks(content)
+        content = _strip_citations(content)
 
         # 提取工具调用
         tool_calls = None
@@ -563,8 +586,8 @@ async def anthropic_messages(
                 if result[1] is not None:
                     content = result[1]  # 使用清理后的文本（含 MiMoML 残留清理）
 
-        # Stateless 策略：用完即焚
-        asyncio.create_task(client.delete_conversations([conv_id]))
+        content = _strip_tool_name_prefix(content, tool_names or [])
+        content = _strip_mimo_prefix(content)
 
         # 构建 OpenAI 格式的非流式响应
         message = {"role": "assistant", "content": content}
@@ -655,7 +678,7 @@ async def anthropic_create_batch_ep(request: Request):
         ob = _anthropic_convert_request(req.get("body", {}))
         msgs = ob.get("messages", [])
         msgs_objs = [OpenAIMessage(**m) if isinstance(m, dict) else m for m in msgs]
-        query, config, _ = build_query_from_messages(msgs_objs)
+        query = build_query_from_messages(msgs_objs)
 
         account = config_manager.get_next_account()
         if not account:
@@ -663,8 +686,7 @@ async def anthropic_create_batch_ep(request: Request):
 
         client = MimoClient(account)
         try:
-            # Batch 暂时默认不启用 [tool=on]
-            c, tc, usage = await client.call_api(query, False, model, tools_enabled=False)
+            c, tc, usage = await client.call_api(query, False, model)
             c = _strip_citations(c)
             message = {"role": "assistant", "content": c}
             if tc:
@@ -681,6 +703,7 @@ async def anthropic_create_batch_ep(request: Request):
         except Exception as e:
             return _anthropic_error_response(str(e)[:500], "api_error")
 
+    import asyncio
     asyncio.create_task(_anthropic_process_batch_requests(batch["id"], _process_one))
     return batch
 
