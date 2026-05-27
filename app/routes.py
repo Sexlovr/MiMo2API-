@@ -428,15 +428,20 @@ async def chat_completions(
 
     # 构建查询
     passthrough_mode = request.passthrough or config_manager.config.tools_passthrough
-    query, tools_enabled = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
+    query, tools_enabled, full_history = build_query_from_messages(request.messages, tools=tools_dict, passthrough=passthrough_mode)
 
     thinking = bool(request.reasoning_effort)
     client = MimoClient(account)
 
-    # 会话管理：通过消息指纹续接 MiMo conversationId
+    # 会话管理：现已修改为：每次请求都创建全新的会话，确保不复用旧 chat。
     conv_id, conv_is_new = _get_or_create_session(
         account.user_id, request.messages, request.model
     )
+
+    # 文件上下文策略：将 full_history 上传为 txt
+    import base64 as b64_std
+    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, request.model)
     # 立即用当前消息更新指纹（对新会话：设置初值；对已有会话：更新续接后的指纹）
     _update_session_fingerprint(account.user_id, conv_id, request.messages)
 
@@ -1434,7 +1439,7 @@ async def _do_response_chat(body: dict, account) -> tuple:
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(openai_messages)
     effective_model = model
 
-    multi_medias = []
+    multi_medias = [history_media_obj] if history_media_obj else []
     if base64_medias:
         for media in base64_medias:
             media_obj = await upload_media_to_mimo(
@@ -1454,9 +1459,16 @@ async def _do_response_chat(body: dict, account) -> tuple:
     tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
 
     # 构建查询
-    query, tools_enabled = build_query_from_messages(openai_messages, tools=tools_dict)
+    query, tools_enabled, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
 
     thinking = False
+
+    # 文件上下文策略
+    import base64 as b64_std
+    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
+    if history_media:
+        multi_medias.insert(0, history_media)
 
     # 调用 MimoClient
     client = MimoClient(account)
@@ -1575,8 +1587,15 @@ async def _stream_response_events(body: dict, account):
                 multi_medias.append(media_obj)
 
     tools_dict = [dict(t) if hasattr(t, 'dict') else t for t in tools] if tools else None
-    query, tools_enabled = build_query_from_messages(openai_messages, tools=tools_dict)
+    query, tools_enabled, full_history = build_query_from_messages(openai_messages, tools=tools_dict)
     thinking = False
+
+    # 文件上下文策略
+    import base64 as b64_std
+    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    history_media = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, effective_model)
+    if history_media:
+        multi_medias.insert(0, history_media)
 
     response_id = body.get("_response_id") or _gen_response_id()
     created_t = int(time.time())

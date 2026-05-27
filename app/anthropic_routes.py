@@ -433,7 +433,7 @@ async def anthropic_messages(
             msgs_as_objects.append(m)
 
     tools_dict = openai_tools
-    query, tools_enabled = build_query_from_messages(msgs_as_objects, tools=tools_dict)
+    query, tools_enabled, full_history = build_query_from_messages(msgs_as_objects, tools=tools_dict)
 
     # ── 提取并上传图片/文件 ──
     query_text, base64_medias, text_files, processed_msgs = extract_medias_from_messages(msgs_as_objects)
@@ -468,7 +468,12 @@ async def anthropic_messages(
                     print(f"[Anthropic] failed to download image URL {url}: {e}")
 
     # 上传到 MiMo CDN
-    multi_medias = []
+    # 文件上下文策略
+    import base64 as b64_std
+    history_b64 = b64_std.b64encode(full_history.encode('utf-8')).decode('utf-8')
+    media_obj = await upload_text_file_to_mimo(history_b64, "history.txt", "text/plain", account, model)
+
+    multi_medias = [media_obj] if media_obj else []
     if base64_medias:
         for media in base64_medias:
             media_obj = await upload_media_to_mimo(
@@ -630,7 +635,7 @@ async def anthropic_create_batch_ep(request: Request):
         ob = _anthropic_convert_request(req.get("body", {}))
         msgs = ob.get("messages", [])
         msgs_objs = [OpenAIMessage(**m) if isinstance(m, dict) else m for m in msgs]
-        query, _ = build_query_from_messages(msgs_objs)
+        query, _, _ = build_query_from_messages(msgs_objs)
 
         account = config_manager.get_next_account()
         if not account:
